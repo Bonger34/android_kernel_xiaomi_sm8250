@@ -1,7 +1,0 @@
-name: pat-test
-on: workflow_dispatch
-jobs:
-  t:
-    runs-on: ubuntu-22.04
-    steps:
-      - run: echo ok
