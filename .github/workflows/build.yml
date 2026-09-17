@@ -40,15 +40,23 @@ jobs:
           echo "$HOME/tc/bin" >> "$GITHUB_PATH"
           "$HOME/tc/bin/clang" --version
 
+      # ── 修复 ①：Configure 步骤也必须带 LLVM=1 ──────────────────────────
+      # 原版只在 Build 步骤加了 LLVM=1，Configure 没加，导致：
+      #   AS 回退到宿主 GNU as
+      #   → Kconfig 调用 scripts/as-version.sh
+      #   → 该脚本引用同目录的 min-tool-version.sh
+      #   → 但此文件在 4.19 分支中不存在（404）
+      #   → 报 "Sorry, this assembler is not supported."
+      # 加上 LLVM=1 后 AS 走 LLVM 路径，不再触发该校验（已本地实测通过）。
       - name: Configure
         run: |
           set -e
-          make O=out ARCH=arm64 ${{ inputs.defconfig }}
+          make O=out ARCH=arm64 LLVM=1 ${{ inputs.defconfig }}
           scripts/kconfig/merge_config.sh -O out out/.config ${{ inputs.fragments }}
-          make O=out ARCH=arm64 olddefconfig
+          make O=out ARCH=arm64 LLVM=1 olddefconfig
           if [ "${{ inputs.disable_hardening }}" = "true" ]; then
             scripts/config --file out/.config -d LTO_CLANG -d CFI_CLANG -d SHADOW_CALL_STACK -d CC_WERROR
-            make O=out ARCH=arm64 olddefconfig
+            make O=out ARCH=arm64 LLVM=1 olddefconfig
           fi
           echo "==== key config ===="
           grep -E "^CONFIG_(KSU|KPROBES|KPROBE_EVENTS|HAVE_KPROBES|LTO_CLANG|CFI_CLANG|CC_WERROR|SHADOW_CALL_STACK)=" out/.config || true
