@@ -1,0 +1,67 @@
+name: Build Kernel (KernelSU)
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: base defconfig
+        required: true
+        default: vendor/kona-perf_defconfig
+      fragments:
+        description: config fragments (space separated)
+        required: false
+        default: arch/arm64/configs/vendor/debugfs.config arch/arm64/configs/vendor/xiaomi/sm8250-common.config arch/arm64/configs/vendor/xiaomi/umi.config
+      disable_hardening:
+        description: disable CFI/LTO/SCS/WERROR (true/false)
+        required: false
+        default: "false"
+      clang_repo:
+        description: clang prebuilt repo
+        required: false
+        default: LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev \
+            python3 python-is-python3 rsync zip unzip cpio lz4 xz-utils git curl build-essential
+
+      - name: Fetch clang toolchain
+        run: |
+          git clone --depth 1 "https://github.com/${{ inputs.clang_repo }}" "$HOME/tc"
+          echo "$HOME/tc/bin" >> "$GITHUB_PATH"
+          "$HOME/tc/bin/clang" --version
+
+      - name: Configure
+        run: |
+          set -e
+          make O=out ARCH=arm64 ${{ inputs.defconfig }}
+          scripts/kconfig/merge_config.sh -O out out/.config ${{ inputs.fragments }}
+          make O=out ARCH=arm64 olddefconfig
+          if [ "${{ inputs.disable_hardening }}" = "true" ]; then
+            scripts/config --file out/.config -d LTO_CLANG -d CFI_CLANG -d SHADOW_CALL_STACK -d CC_WERROR
+            make O=out ARCH=arm64 olddefconfig
+          fi
+          echo "==== key config ===="
+          grep -E "^CONFIG_(KSU|KPROBES|KPROBE_EVENTS|HAVE_KPROBES|LTO_CLANG|CFI_CLANG|CC_WERROR|SHADOW_CALL_STACK)=" out/.config || true
+
+      - name: Build
+        run: |
+          make O=out ARCH=arm64 LLVM=1 -j"$(nproc)" Image
+          ls -lh out/arch/arm64/boot/Image
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-image
+          path: |
+            out/arch/arm64/boot/Image
+            out/.config
+          if-no-files-found: error
