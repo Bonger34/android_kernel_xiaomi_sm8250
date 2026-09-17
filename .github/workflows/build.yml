@@ -40,26 +40,35 @@ jobs:
           echo "$HOME/tc/bin" >> "$GITHUB_PATH"
           "$HOME/tc/bin/clang" --version
 
-      # ── 修复 ①：Configure 步骤也必须带 LLVM=1 ──────────────────────────
-      # 原版只在 Build 步骤加了 LLVM=1，Configure 没加，导致：
-      #   AS 回退到宿主 GNU as
-      #   → Kconfig 调用 scripts/as-version.sh
-      #   → 该脚本引用同目录的 min-tool-version.sh
-      #   → 但此文件在 4.19 分支中不存在（404）
-      #   → 报 "Sorry, this assembler is not supported."
-      # 加上 LLVM=1 后 AS 走 LLVM 路径，不再触发该校验（已本地实测通过）。
+      # ── 修复 ①：Configure 必须带 LLVM=1 ───────────────────────────────
+      # 原版只在 Build 步骤加，Configure 没加，导致 AS 回退到宿主 GNU as，
+      # Kconfig 调 scripts/as-version.sh，该脚本引用同目录的
+      # min-tool-version.sh —— 此文件在 4.19 分支不存在（上游也 404），
+      # 于是报 "Sorry, this assembler is not supported."
+      #
+      # ── 修复 ②：不要用 scripts/kconfig/merge_config.sh ─────────────────
+      # 它内部是 KCONFIG_ALLCONFIG + alldefconfig，会把片段里
+      # 依赖其它符号的配置项静默丢掉。实测 umi.config 的 22 条只剩 1 条
+      # （CONFIG_KSU 侥幸留下，CONFIG_KPROBES / CONFIG_MACH_XIAOMI_UMI
+      #  / 触屏 / 指纹 / 充电 / 振动 / 相机 全丢）。
+      # 后果一：内核没有 KPROBES → KernelSU 完全不工作。
+      # 后果二：CONFIG_MACH_XIAOMI_SM8250 未设 → ufshcd.c 里
+      #         #ifndef 守卫的变量变成 unused → 触发 -Werror 编译失败。
+      # 改为按顺序拼接进 defconfig（后写覆盖先写），实测 22/22 全部落地。
       - name: Configure
         run: |
           set -e
+          cat arch/arm64/configs/${{ inputs.defconfig }} \
+              ${{ inputs.fragments }} > /tmp/merged_defconfig
+          cp /tmp/merged_defconfig arch/arm64/configs/${{ inputs.defconfig }}
           make O=out ARCH=arm64 LLVM=1 ${{ inputs.defconfig }}
-          scripts/kconfig/merge_config.sh -O out out/.config ${{ inputs.fragments }}
           make O=out ARCH=arm64 LLVM=1 olddefconfig
           if [ "${{ inputs.disable_hardening }}" = "true" ]; then
             scripts/config --file out/.config -d LTO_CLANG -d CFI_CLANG -d SHADOW_CALL_STACK -d CC_WERROR
             make O=out ARCH=arm64 LLVM=1 olddefconfig
           fi
           echo "==== key config ===="
-          grep -E "^CONFIG_(KSU|KPROBES|KPROBE_EVENTS|HAVE_KPROBES|LTO_CLANG|CFI_CLANG|CC_WERROR|SHADOW_CALL_STACK)=" out/.config || true
+          grep -E "^CONFIG_(KSU|KPROBES|KPROBE_EVENTS|HAVE_KPROBES|MACH_XIAOMI_UMI|MACH_XIAOMI_SM8250|LTO_CLANG|CFI_CLANG|CC_WERROR|SHADOW_CALL_STACK)=" out/.config || true
 
       - name: Build
         run: |
