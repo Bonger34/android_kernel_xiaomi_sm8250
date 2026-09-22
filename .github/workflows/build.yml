@@ -11,7 +11,7 @@ on:
         required: false
         default: arch/arm64/configs/vendor/debugfs.config arch/arm64/configs/vendor/xiaomi/sm8250-common.config arch/arm64/configs/vendor/xiaomi/umi.config
       disable_hardening:
-        description: disable CFI/LTO/SCS/WERROR (true/false)
+        description: disable CFI/SCS/WERROR, keep LTO (true/false)
         required: false
         default: "false"
       clang_repo:
@@ -64,11 +64,18 @@ jobs:
           make O=out ARCH=arm64 LLVM=1 ${{ inputs.defconfig }}
           make O=out ARCH=arm64 LLVM=1 olddefconfig
           if [ "${{ inputs.disable_hardening }}" = "true" ]; then
-            scripts/config --file out/.config -d LTO_CLANG -d CFI_CLANG -d SHADOW_CALL_STACK -d CC_WERROR
+            # 只关 CFI 与 SCS，**保留 LTO** —— 社区两个能跑的 4.19 SM8250 内核
+            # 都是 LTO 开 + CFI 关；关 CFI 不需要关 LTO（CFI_CLANG depends on LTO_CLANG）。
+            scripts/config --file out/.config -d CFI_CLANG -d SHADOW_CALL_STACK -d CC_WERROR
             make O=out ARCH=arm64 LLVM=1 olddefconfig
           fi
           echo "==== key config ===="
           grep -E "^CONFIG_(KSU|KPROBES|KPROBE_EVENTS|HAVE_KPROBES|MACH_XIAOMI_UMI|MACH_XIAOMI_SM8250|LTO_CLANG|CFI_CLANG|CC_WERROR|SHADOW_CALL_STACK)=" out/.config || true
+          # ⚠️ 硬闸门：这两个必须是 y。历史上 merge_config.sh 静默丢片段，
+          #    丢掉 CONFIG_KPROBES ⇒ KernelSU 完全不工作且不报错。宁可让构建挂掉。
+          grep -q "^CONFIG_KSU=y$" out/.config
+          grep -q "^CONFIG_KPROBES=y$" out/.config
+          echo "  ✅ CONFIG_KSU=y / CONFIG_KPROBES=y"
 
       - name: Build
         run: |
@@ -81,4 +88,5 @@ jobs:
           path: |
             out/arch/arm64/boot/Image
             out/.config
+            out/System.map
           if-no-files-found: error
