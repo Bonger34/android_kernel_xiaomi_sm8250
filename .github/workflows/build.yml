@@ -23,6 +23,13 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
+    env:
+      # ── 可复现构建：三个变量必须固定 ──────────────────────────────────
+      # scripts/mkcompile_h L37-51：不设则退回 `date` / `whoami` / `uname -n`，
+      # 而 GitHub runner 的主机名每次随机 ⇒ 两次构建的 uname -v 与 banner 必不同。
+      TZ: UTC
+      KBUILD_BUILD_USER: bonger
+      KBUILD_BUILD_HOST: github-actions
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,6 +46,28 @@ jobs:
           git clone --depth 1 "https://github.com/${{ inputs.clang_repo }}" "$HOME/tc"
           echo "$HOME/tc/bin" >> "$GITHUB_PATH"
           "$HOME/tc/bin/clang" --version
+
+      # ── 可复现构建 ─────────────────────────────────────────────────────
+      # ① KBUILD_BUILD_TIMESTAMP 取该提交的提交时间。LOS 侧没有原厂要对齐，
+      #    唯一目标是「同一提交两次构建逐字节相同」；不设则 mkcompile_h 用 `date`。
+      # ② kernel/gen_kheaders.sh 的 tar 记录源文件 mtime（= checkout 时刻），压缩后长度每次
+      #    不同 —— 实测两次构建差 520 字节，把 kernel_headers_data 之后的约 10MB 整体顶偏
+      #    （System.map 里 41,741 行地址随之变化）。SOURCE_DATE_EPOCH 对 GNU tar 无效，须 --mtime。
+      # ③ build-id 默认含随机成分；改 sha1 后由内容决定。
+      - name: Pin build timestamp (reproducible build)
+        run: |
+          TS="$(git show -s --format=%cd --date=format-local:'%a %b %-d %H:%M:%S UTC %Y' HEAD)"
+          [ -n "$TS" ] || { echo "取不到提交时间"; exit 1; }
+          date -d "$TS" +%s > /dev/null || { echo "时间戳无法解析: $TS"; exit 1; }
+          echo "KBUILD_BUILD_TIMESTAMP=$TS" >> "$GITHUB_ENV"
+          echo "  pinned KBUILD_BUILD_TIMESTAMP = $TS"
+
+      - name: Make the build reproducible
+        run: |
+          sed -i 's|^tar -Jcf \$tarfile|tar --mtime=@0 --owner=0 --group=0 --numeric-owner -Jcf $tarfile|' kernel/gen_kheaders.sh
+          grep -n "Jcf" kernel/gen_kheaders.sh
+          sed -i 's|^LDFLAGS_BUILD_ID := .*|LDFLAGS_BUILD_ID := --build-id=sha1|' Makefile
+          grep -n "LDFLAGS_BUILD_ID" Makefile
 
       # ── 修复 ①：Configure 必须带 LLVM=1 ───────────────────────────────
       # 原版只在 Build 步骤加，Configure 没加，导致 AS 回退到宿主 GNU as，
