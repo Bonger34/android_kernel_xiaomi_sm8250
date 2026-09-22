@@ -89,4 +89,7 @@ jobs:
             out/arch/arm64/boot/Image
             out/.config
             out/System.map
+          # ⚠️ upload-artifact v4 默认排除隐藏文件 —— .config 以点开头，不开这个就永远传不上去，
+          #    而且**不报错**。本项目实测：下载回来的 artifact 里只有 Image，没有 .config。
+          include-hidden-files: true
           if-no-files-found: error
