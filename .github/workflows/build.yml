@@ -19,7 +19,7 @@ on:
         required: false
         default: LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b
       sentinel_self_test:
-        description: "环境哨兵负向自测：故意换掉已知内核，哨兵必须失败、构建必须中止（true/false）"
+        description: "环境哨兵负向自测：故意换掉已知输入，哨兵必须失败、构建必须中止（true/false）"
         required: false
         default: "false"
 
@@ -55,11 +55,12 @@ jobs:
       #   两个 release 的壳来自**同一份底包**（T6 已证：ramdisk 解压后逐字节相同），而 repack
       #   只从壳里读 ramdisk / dtb / vbmeta / header —— **独独不读壳里的那个内核**。
       #   ⇒ repack(正式版 boot.img, CFI Image) ≡ repack(底包, CFI Image) = CFI 版 boot.img。
-      #   这样**三个哈希互不相同**（期望 24f29222… ≠ 壳 4c556237… ≠ 内核 3a9e1c20…），
+      #   这样**期望值与两个输入件三者互不相同**（期望 24f29222… ≠ 壳 4c556237… ≠ 内核 3a9e1c20…），
       #   不会退化成「拿文件跟自己比」—— 那种检查把工具换成一句 `cp` 也照样能过。
       #
-      # 三个哈希都取自**工作区**里的 `docs/manifests/los-releases-sha256.txt`（已发布资产的钉值）。
-      # ⚠️ 重发资产 / 换 release 之后必须同步改这里 —— 期望值变了，哨兵就该响亮地失败。
+      # 本步骤用到的**每一个哈希**都取自**工作区**里的 `docs/manifests/los-releases-sha256.txt`
+      # （已发布资产的钉值）。⚠️ 重发资产 / 换 release 之后必须同步改这里 ——
+      # 期望值变了，哨兵就该响亮地失败。
       - name: "Environment sentinel — repack must reproduce published bytes"
         env:
           BASE_URL: https://github.com/${{ github.repository }}/releases/download/ksu-v0.9.5-lineage23.2-umi/boot-LOS23.2-ksu-0.9.5-umi.img
@@ -67,7 +68,9 @@ jobs:
           KERNEL_URL: https://github.com/${{ github.repository }}/releases/download/ksu-v0.9.5-lineage23.2-cfi-umi/Image-micode-4.19.325-perf-gb9c8bf5e4b79-LOS23.2-cfi-ksu-0.9.5
           KERNEL_SHA: 3a9e1c208795179595c60b6ffba25ed33605b179d366bc74b40f28980c2945c1
           EXPECT_SHA: 24f2922235b5ea63819dacee3101cec7d1be964b21cecf5e648da3ad397fc157
-          # 负向自测用的「另一个内核」= 正式版的 Image（同样是已发布件，哈希同样钉死）
+          # 负向自测用的**另一对**已发布件（同样是钉死的哈希）
+          ALT_BASE_URL: https://github.com/${{ github.repository }}/releases/download/ksu-v0.9.5-lineage23.2-cfi-umi/boot-LOS23.2-cfi-ksu-0.9.5-umi.img
+          ALT_BASE_SHA: 24f2922235b5ea63819dacee3101cec7d1be964b21cecf5e648da3ad397fc157
           ALT_KERNEL_URL: https://github.com/${{ github.repository }}/releases/download/ksu-v0.9.5-lineage23.2-umi/Image-micode-4.19.325-perf-gb9c8bf5e4b79-LOS23.2-ksu-0.9.5
           ALT_KERNEL_SHA: 0157c33f9a4a048cde921402ba832c666436671b4426851370c21864a86c4334
           SELF_TEST: ${{ inputs.sentinel_self_test }}
@@ -79,8 +82,11 @@ jobs:
           echo "runner  : ${ImageOS:-?} ${ImageVersion:-?}"
 
           if [ "$SELF_TEST" = "true" ]; then
-            echo "⚠️  负向自测模式：把已知内核换成正式版的 Image（3a9e1c20… → 0157c33f…）"
-            echo "    本步骤**必须失败** —— 它通过就说明哨兵没有真在校验。"
+            echo "⚠️  负向自测模式：壳 正式版→CFI 版、内核 CFI 版→正式版，**期望值不动**"
+            echo "    本步骤**必须失败** —— 它通过就说明哨兵（或重打包工具）已经坏了。"
+            echo "    下面报的『最可能的原因』对本次**不适用**：真因是输入被**故意**换掉了。"
+            BASE_URL="$ALT_BASE_URL"
+            BASE_SHA="$ALT_BASE_SHA"
             KERNEL_URL="$ALT_KERNEL_URL"
             KERNEL_SHA="$ALT_KERNEL_SHA"
           fi
@@ -94,8 +100,8 @@ jobs:
               echo "❌ 输入件不是期望的那一份: $3"
               echo "   期望 $2"
               echo "   实际 $got"
-              echo "   ⇒ 最可能的原因：release 上的资产被重新上传过（哈希清单该更新了），"
-              echo "     或下载被截断（大文件会静默截断，见 PROJECT.md 坑表 #21）。"
+              echo "   ⇒ 最可能的原因：release 上的资产被重新上传/删除（哈希清单该更新了），"
+              echo "     或下载被截断（大文件会静默截断，见项目文档 PROJECT.md §7 坑表 #21）。"
               exit 1
             fi
             echo "✅ 输入件 $3  $got"
