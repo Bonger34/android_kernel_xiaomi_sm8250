@@ -451,17 +451,20 @@ def main(argv):
     ap.add_argument("--merge-base", metavar="SHA", help="两者的 merge-base（必填，本工具不自己算）")
     ap.add_argument("--marker", metavar="文件", help="心跳分支上的状态文件（JSON）")
     ap.add_argument("--today", metavar="YYYY-MM-DD", help="「今天」（默认取 UTC 当天）")
-    ap.add_argument("--expire-days", type=int, default=EXPIRE_DAYS, help="失败标记有效期（默认 7）")
-    ap.add_argument("--heartbeat-days", type=int, default=HEARTBEAT_DAYS, help="心跳间隔（默认 30）")
-    ap.add_argument("--upstream-subject", help="上游 HEAD 的提交标题，只进输出（给 issue 标题用）")
+    ap.add_argument("--expire-days", type=int, default=EXPIRE_DAYS, metavar="N",
+                    help="失败标记有效期（默认 7）")
+    ap.add_argument("--heartbeat-days", type=int, default=HEARTBEAT_DAYS, metavar="N",
+                    help="心跳间隔（默认 30）")
+    ap.add_argument("--upstream-subject", metavar="文本",
+                    help="上游 HEAD 的提交标题，只进输出（给 issue 标题用）")
     ap.add_argument("--json", action="store_true", help="输出 JSON（给脚本吃）")
     ap.add_argument("--self-test", action="store_true", help="跑内置的表驱动用例（不联网、不读参数）")
-    ap.add_argument("--self-test-dir", default=None, help="自测用的临时目录（默认系统临时目录）")
+    ap.add_argument("--self-test-dir", metavar="目录", default=None,
+                    help="自测用的临时目录（默认系统临时目录）")
     a = ap.parse_args(argv[1:])
 
-    if "--help" in argv[1:] or "-h" in argv[1:]:
-        print(__doc__)
-        return EXIT_USAGE
+    # 注意：`-h/--help` 到不了这里 —— argparse 自己打印帮助并以 0 退出（那是对的，
+    # 帮助不是用法错误）。文件头那份说明留给读源码的人。
 
     if a.self_test:
         import tempfile
