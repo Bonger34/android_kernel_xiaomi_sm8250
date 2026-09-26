@@ -38,8 +38,39 @@ on:
         description: "本批次对应的上游提交（规格 §5 来源说明四项之一；留空 = 未记录，手动触发就是这样）"
         required: false
         default: ""
+      merge_sha:
+        description: "【上游同步通道】要在本线 HEAD 上重放的**合并提交**（检测器试合并算出来的）。留空 = 不合并，直接编分支 HEAD —— 手动触发就是这样"
+        required: false
+        default: ""
+      merge_base:
+        description: "【上游同步通道】那个合并的**基点**（检测器从 compare API 拿到的权威值，与 merge_sha 配对）"
+        required: false
+        default: ""
+      base_sha256:
+        description: "【上游同步通道】检测器取的那份底包的 sha256；给了就核（复用底包那条路的交叉验证）"
+        required: false
+        default: ""
+      upstream_url:
+        description: "【上游同步通道】上游仓库的 git URL（重放那次合并时要按 sha 取它的对象）。留空 = LineageOS 的 23.2 内核仓库"
+        required: false
+        default: "https://github.com/LineageOS/android_kernel_xiaomi_sm8250.git"
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  上游同步通道（issue #8）：本 workflow 现在是**被检测器派发**的那一个
+#
+#  检测器（detect.yml）发现漂移后：试合并 → 取一次底包 → 用 `GITHUB_TOKEN` 派发本
+#  workflow，并把这几个入参传过来（**一个都不能为空**，见 `trigger-build.py --require`）：
+#
+#    upstream_sha   上游那个提交
+#    merge_base     那个合并的基点（API 的权威值）
+#    merge_sha      合并提交 —— **两个 build job 各自重放它并断言 sha 相同**
+#    base_run_id / base_artifact   检测器取的那份底包（`prepare` 复用它，不自己现拉）
+#    base_sha256    检测器算出的底包哈希（`prepare` 复算一遍交叉验证）
+#
+#  ⚠️ **手动触发仍然是完整可用的兜底入口**（规格实现决定 1）：那几个入参全留空即可，
+#     此时本 workflow 的行为与 #7 之前**一模一样**（编分支 HEAD，不合并）。
+#     「构建器只带 `workflow_dispatch` ⇒ 它永不被 inactivity 停用」这条不变。
+#
 #  两次构建逐字节比对（issue #6，规格实现决定 5 与用户故事 12）
 #
 #  拓扑：prepare（哨兵 + 取一次底包） → build ×2（两个独立 runner，max-parallel=1）
@@ -49,6 +80,8 @@ on:
 #   ① **底包只取一次，由 prepare 分发**。两次各自「现拉最新」的话，官网恰好跨期
 #      就会产出**不同的字节**，而那是**假失败**（规格实现决定 4 的原话）。
 #      也正因为共用这一份，两个 job 之间才**只有底包**这一个共享输入。
+#      ⚠️ #8 起「取一次」发生在**更上游**（检测器），prepare 走的是**复用**那条路；
+#      手动触发时仍是 prepare 自己取。两条路的落点相同：`base.img` + `base-fetch.log`。
 #   ② **两次编译必须落在两个 runner 上**（`max-parallel: 1`）。同一 runner 上连着跑两次
 #      会共享 ccache / 临时目录 / 时钟，比对的就不是「独立编译」了。
 #   ③ **失败也要把两份产物都留下来**（`if: always()`）。比对失败时，产物本身就是诊断材料。
@@ -244,6 +277,8 @@ jobs:
       #    这一步是为两次构建准备输入 —— 输入的哈希必须在两个 job 之**前**就定下来，
       #    否则「两份产物用了同一份底包」只是口头约定。
       - name: "Record the base sha256 (the one input both builds will share)"
+        env:
+          BASE_SHA256: ${{ inputs.base_sha256 }}
         run: |
           set -euo pipefail
           GOT="$(sha256sum base.img | cut -d' ' -f1)"
@@ -255,6 +290,24 @@ jobs:
             exit 1
           fi
           echo "  ✅ 与取底包那一步记的那一行一致"
+          # ⚠️ 【#8】检测器取底包时把它算出的 sha256 **一起传了过来**（issue #8 的正文：
+          #    「把上游提交与底包 sha256 传过去」）。这里是那个值的**接收端**：
+          #    两处独立算出的哈希必须逐字相同 —— 否则「两个 build job 用的是同一份底包」
+          #    只是「两个 job 用的是同一份 artifact」，而 artifact 里到底是不是检测器
+          #    验过的那份，没有人核过。
+          if [ -n "$BASE_SHA256" ]; then
+            if [ "$BASE_SHA256" != "$GOT" ]; then
+              echo "❌ 本 pass 用的底包与**检测器取的那份**不是同一份。"
+              echo "   检测器传过来的 : $BASE_SHA256"
+              echo "   本 pass 复算的 : $GOT"
+              echo "   ⇒ 最可能的原因：复用的 artifact 不是那一个（名字对上了、内容被换过？），"
+              echo "     或复用那次 run 的 artifact 被重新上传过。"
+              exit 1
+            fi
+            echo "  ✅ 与**检测器取的那份**逐字相同：$BASE_SHA256"
+          else
+            echo "  ⚠️ 没传 --input base_sha256（手动触发就是这样）⇒ 只核了「日志与文件一致」"
+          fi
           echo "$GOT" > base.sha256
 
       - uses: actions/upload-artifact@v4
@@ -311,6 +364,39 @@ jobs:
           echo "  底包 sha256（prepare 记下的）= $(cat base.sha256)"
           echo "  本 pass 复算                = $(sha256sum base.img | cut -d' ' -f1)"
 
+      # ══ 重放那次合并（issue #8）══════════════════════════════════════════════
+      # ⚠️ 与检测器**同一个工具、同一对输入**，而且要**断言 sha 逐字相同**。
+      #    为什么必须相同（而不是「各自合一次、编出来一样就行」）：内核自己的
+      #    `scripts/setlocalversion` 会把 `git rev-parse --short HEAD` 拼进版本串，
+      #    两次的 HEAD 不是同一个提交 ⇒ 编出来的 Image 必然不同 —— 那是**假失败**。
+      #    所以「合并提交是确定的」是这条通道能成立的前提，不是洁癖。
+      #
+      # ⚠️ 为什么两个 build job **各自重放**，而不是把合并提交传过来：
+      #    合并提交不在任何 ref 上（规格要求「绝不 push」），传它只能走 git bundle。
+      #    重放一遍更便宜，而且它把「两次构建编的是同一个提交」变成**两次独立的复核**。
+      #
+      # ⚠️ `--merge-base` 也用检测器传过来的那一个：工具会断言本地算出来的 merge-base
+      #    与它相等，不等就**不合并**（拿截断的祖先去合并会得到一次不报错的错合并）。
+      - name: "Replay the upstream merge (same tool, same inputs, asserted sha)"
+        if: inputs.merge_sha != ''
+        env:
+          MERGE_SHA: ${{ inputs.merge_sha }}
+          MERGE_BASE: ${{ inputs.merge_base }}
+          UPSTREAM_SHA: ${{ inputs.upstream_sha }}
+          UPSTREAM_URL: ${{ inputs.upstream_url }}
+        run: |
+          set -euo pipefail
+          echo "本 pass 的 HEAD（检出到的那一个）= $(git rev-parse HEAD)"
+          python3 .github/scripts/try-merge.py \
+            --repo-dir . \
+            --work-branch "${{ github.ref_name }}" \
+            --upstream-url "$UPSTREAM_URL" \
+            --upstream-sha "$UPSTREAM_SHA" \
+            --merge-base "$MERGE_BASE" \
+            --expect-merge-sha "$MERGE_SHA"
+          echo "  ⇒ 本 pass 要编的就是合并提交 $(git rev-parse HEAD)"
+          echo "  ⇒ 它不在任何分支上（detached）—— 这正是「绝不 push」的样子"
+
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
@@ -327,6 +413,9 @@ jobs:
       # ① KBUILD_BUILD_TIMESTAMP 取该提交的提交时间。LOS 侧没有原厂要对齐，
       #    唯一目标是「同一提交两次构建逐字节相同」；不设则 mkcompile_h 用 `date`。
       #    两次编译检出的是**同一个提交**（同一 run 的 github.sha）⇒ 这个值两份相同。
+      #    ⚠️ 【#8】上游同步通道触发时 HEAD 是**合并提交**（上面那一步重放出来的），
+      #    而它的 committer date 被 `try-merge.py` **锚定到上游提交的日期** ——
+      #    于是「什么时候跑的」不影响字节，同一个上游状态下任何一天构建都一样。
       # ② kernel/gen_kheaders.sh 的 tar 记录源文件 mtime（= checkout 时刻），压缩后长度每次
       #    不同 —— 实测两次构建差 520 字节，把 kernel_headers_data 之后的约 10MB 整体顶偏
       #    （System.map 里 41,741 行地址随之变化）。SOURCE_DATE_EPOCH 对 GNU tar 无效，须 --mtime。
@@ -338,6 +427,7 @@ jobs:
           date -d "$TS" +%s > /dev/null || { echo "时间戳无法解析: $TS"; exit 1; }
           echo "KBUILD_BUILD_TIMESTAMP=$TS" >> "$GITHUB_ENV"
           echo "  pinned KBUILD_BUILD_TIMESTAMP = $TS"
+          echo "  取自 HEAD = $(git rev-parse HEAD)$( [ -n "${{ inputs.merge_sha }}" ] && echo '（合并提交；committer date 锚定到上游提交）' || echo '（本线分支 HEAD）')"
 
       - name: Make the build reproducible
         run: |
@@ -412,7 +502,7 @@ jobs:
             --out-dir dist \
             --repo "${{ github.repository }}" \
             --branch "${{ github.ref_name }}" \
-            --commit "${{ github.sha }}" \
+            --commit "$(git rev-parse HEAD)" \
             --upstream-sha "${{ inputs.upstream_sha }}" \
             --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --fetch-log base-fetch.log

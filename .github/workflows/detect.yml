@@ -1,28 +1,32 @@
 # ══════════════════════════════════════════════════════════════════════════════
-#  检测器（上游同步通道 · issue #7）：**漂移发现 + 心跳**。只判定，不构建。
+#  检测器（上游同步通道 · issue #7 + #8）：**漂移发现 + 心跳 + 试合并 + 触发构建**。
 #
 #  规格：`docs/los-line/upstream-sync-spec.md`（工作区文档，不在本仓库里）
 #    实现决定 1 —— 两个 workflow 职责分开：**只有本文件带 `schedule`**
 #      ⇒ 只有它会被 GitHub 的 inactivity 规则停用；构建器（build.yml）只带
 #        `workflow_dispatch`，永远点得动，是维护者永远的兜底入口。
+#      ⚠️ #8 起本文件还要**触发**构建器 ⇒ `permissions:` 里必须有 `actions: write`
+#        （漏了就是 403 `Resource not accessible by integration`）。
 #    实现决定 2 —— **直接比上游**，判据是 merge-base（不是「上游 sha == 本地 sha」：
 #      我们这条跟随分支永远带着自己的提交，正常情况下也永远不等于上游 HEAD）。
 #    实现决定 3 —— 心跳：往一条**孤儿分支**写一个**带真实内容**的提交，距上次 >= 30 天才写。
 #      ⚠️ 为什么非做不可：**workflow 自己的运行不算 repository activity**
 #      ⇒ 纯 cron 的仓库 60 天后会被静默停用（实测 3 个仓库：停用前 60 天里每天 cron
 #        成功运行仍被判 `disabled_inactivity`）；而**非默认分支的 push 算** activity。
+#    实现决定 4 —— 底包**由检测器统一取一次**，再分发给两个构建 job（否则两个 job
+#      各自「现拉最新」，跨几分钟官网换包会造成**假失败**）。
 #    实现决定 7 —— 失败标记与心跳共用**同一个**状态文件（`sync-heartbeat` 分支上的
 #      `sync-state.json`）。本工单只写 `heartbeat`；`failed` 由 #10 写。
 #
-#  ⚠️ **本工单不构建。** 检测到漂移只打印结论 —— 「试合并 → 取底包 → 触发构建」是 #8。
-#     本文件里**没有任何**构建步骤，也没有对构建器的 `workflow_dispatch` 调用
-#     （那要 `actions: write`，见下面的 permissions 注释）。
-#
-#  ⚠️ 判定逻辑**一行都不在 YAML 里**：全是 `python3 .github/scripts/detect.py`，
-#     它再调 `sync-check.py`（接缝 S3，纯决策、零 I/O、零网络，28 条离线用例）。
+#  ⚠️ **判定逻辑一行都不在 YAML 里**：判定是 `python3 .github/scripts/detect.py`
+#     （它再调 `sync-check.py` —— 接缝 S3，纯决策、零 I/O、零网络，28 条离线用例），
+#     试合并是 `try-merge.py`（接缝 S5），派发是 `trigger-build.py`。
 #     为什么：本机**没有可用的 bash**（Windows），写在 YAML 里的步骤只能上 CI 试
 #     （一轮十几分钟）；写成脚本后同一条链在本机就能跑通 —— 而本机有真上游可对。
 #     同 `package.py`（issue #5）的理由。
+#
+#  ⚠️ #8 起本文件**会构建**（间接：派发构建器）。但那四步是**有条件**的：
+#     只有 `detect.py` 判出 `drifted` 才走；无漂移时一次运行仍是 50 秒左右就结束。
 # ══════════════════════════════════════════════════════════════════════════════
 name: Detect upstream drift (heartbeat + drift)
 
@@ -38,13 +42,22 @@ on:
         description: "只判定、不写心跳（演练用）。⚠️ 置 true 会让本次按设计**不写心跳**"
         required: false
         default: "false"
+      upstream_repo:
+        description: "⚠️ 测试钩子：把上游换成别的仓库（留空 = LineageOS/android_kernel_xiaomi_sm8250）"
+        required: false
+        default: ""
+      upstream_ref:
+        description: "⚠️ 测试钩子：把上游 ref 换成别的分支或 sha（留空 = lineage-23.2）。配 `sync-drift-sim` 分支可**手动制造一次真漂移**"
+        required: false
+        default: ""
 
 # ⚠️ **一旦写了 `permissions:`，没列出的权限一律变 `none`。**
 #    `contents: write` 是写心跳分支要的（`contents: read` 已经含在里面，checkout 也要它）。
-#    #8 起检测器还要用 `GITHUB_TOKEN` 触发构建器 ⇒ 那时再加 `actions: write`
+#    `actions: write` 是 #8 用 `GITHUB_TOKEN` 触发构建器要的
 #    （缺了就是 403 `Resource not accessible by integration`，规格实现决定 1 的原话）。
 permissions:
   contents: write
+  actions: write
 
 # 一天一次 + 随时可能手动触发：两次同时跑会撞同一份状态文件。CAS 会让后者响亮地 409
 # （不会互相覆盖，这一点是好的），但那是一次没必要的红。排队等一下比丢掉一次好。
@@ -54,10 +67,16 @@ concurrency:
 
 env:
   # 本线的**跟随分支**（= 本仓库默认分支）。上游同步的一切都对着它。
-  # ⚠️ 「加一条分支 = 改一个变量」的落点就是这三行（规格实现决定 9 / 用户故事 31）。
+  # ⚠️ 「加一条分支 = 改一个变量」的落点就是这几行（规格实现决定 9 / 用户故事 31）。
   WORK_BRANCH: ksu-lineage-23.2
-  UPSTREAM_REPO: LineageOS/android_kernel_xiaomi_sm8250
-  UPSTREAM_BRANCH: lineage-23.2
+  # ⚠️ 这两个默认值可以被 `workflow_dispatch` 的两个**测试钩子**覆盖：上游 `lineage-23.2`
+  #    自 2026-07-13 起没动过 ⇒ 「漂移 → 试合并 → 触发构建」这条主干在真上游上
+  #    **等不到一次触发**，而它恰恰是本工单要验的东西（见 docs/los-line/tickets.md 的 #8 一节）。
+  #    用 `github.event.inputs`（而不是 `inputs`）是因为它在 schedule 触发时同样存在（为 null）。
+  UPSTREAM_REPO: ${{ github.event.inputs.upstream_repo || 'LineageOS/android_kernel_xiaomi_sm8250' }}
+  UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_ref || 'lineage-23.2' }}
+  # 被触发的那个 workflow 的**文件名**（`workflow_dispatch` 按文件名定位）。
+  BUILD_WORKFLOW: build.yml
   # 心跳分支：**孤儿分支**，与任何工作分支没有共同历史（用户故事 23：
   # 「不碰任何工作分支 ⇒ 不会移动分支头、不影响构建时间戳、不和自动合并抢分支」）。
   # ⚠️ 这个值必须与 `detect.py` 的 `HEARTBEAT_BRANCH` 一致 —— 那个默认值只在**本机手跑**
@@ -68,7 +87,7 @@ env:
 jobs:
   detect:
     runs-on: ubuntu-22.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       # ⚠️ `ref:` 显式钉住工作分支：本工作流可以被手动派发到**任何** ref 上
       #    （「检测器被停用时恢复只要点几下」那条验收），而我们要跑的永远是跟随分支上那份
@@ -80,7 +99,7 @@ jobs:
           ref: ${{ env.WORK_BRANCH }}
           fetch-depth: 1
 
-      - name: "检测：漂移发现 + 心跳（只判定，不构建）"
+      - name: "检测：漂移发现 + 心跳"
         id: detect
         env:
           # ⚠️ 用仓库自带的 `GITHUB_TOKEN`，**不用 PAT** —— 这条通道不该有任何长期凭据
@@ -136,6 +155,7 @@ jobs:
           #    ⇒ 下一步读它是**空的**。第一版把它写成后面单独一步，于是它**必然失败**
           #    （实测：run 36263004895 红在那一句上）。这一类「只在 CI 上出现」的错误
           #    与坑表 #37 同族：本机没有 runners 的 step 概念，跑不出来。
+          #    ⚠️ 但**追加**是安全的：后面几步各自往自己那份里写，最后一起并进 job summary。
           if [ ! -s "$GITHUB_STEP_SUMMARY" ]; then
             echo "❌ 运行摘要为空 —— detect.py 的 --summary 没写成功，而运行照样会是绿的"
             exit 1
@@ -145,31 +165,159 @@ jobs:
           cat "$GITHUB_STEP_SUMMARY"
           echo "└───────────────────────────────────────────────"
 
-          if [ "$RC" = "10" ]; then
-            echo "::notice::检测到上游漂移 —— 本工单只发现、不构建（触发构建是 issue #8）"
-          fi
-
       # ⚠️ 这一节是给 #8 的**接口 + 一次真检查**：`state` / `upstream_sha` / `merge_base`
       #    正是 #8「试合并 → 取底包 → 触发构建」要往下传的三个值。
       #    但它不只是打印 —— `--github-output` 那条路一旦坏掉，这里会**当场红**，
       #    而不是等到 #8 拿着一个空值去试合并（那时报的是另一件事，查起来贵得多）。
-      - name: "检查结果确实传了出来（#8 要接的就是这几个值）"
+      - name: "检查结果确实传了出来（#8 接的就是这几个值）"
         run: |
           set -euo pipefail
           STATE="${{ steps.detect.outputs.state }}"
           UP="${{ steps.detect.outputs.upstream_sha }}"
           LO="${{ steps.detect.outputs.local_sha }}"
+          MB="${{ steps.detect.outputs.merge_base }}"
           if [ -z "$STATE" ]; then
             echo "❌ 没拿到 state —— detect.py 的 --github-output 没写成功"
             exit 1
           fi
-          if [ -z "$UP" ] || [ -z "$LO" ]; then
-            echo "❌ 没拿到 sha：upstream='$UP' local='$LO'"
+          if [ -z "$UP" ] || [ -z "$LO" ] || [ -z "$MB" ]; then
+            echo "❌ 没拿全三个 sha：upstream='$UP' local='$LO' merge_base='$MB'"
             exit 1
           fi
           echo "state      = $STATE（退出码 ${{ steps.detect.outputs.exit_code }}）"
           echo "upstream   = $UP"
           echo "local      = $LO"
-          echo "merge_base = ${{ steps.detect.outputs.merge_base }}"
+          echo "merge_base = $MB"
           echo "心跳       = 到期 ${{ steps.detect.outputs.heartbeat_due }} / 已写 ${{ steps.detect.outputs.heartbeat_written }}"
-          echo "（本工单到此为止：无漂移、有漂移都不构建 —— 那是 #8）"
+          if [ "$STATE" = "drifted" ]; then
+            echo "⇒ 有漂移：#8 起下面会试合并 → 取底包 → 触发构建（本工单之前只打印结论）。"
+          else
+            echo "⇒ 不是 drifted：**不试合并、不取底包、不触发构建**，到此为止。"
+          fi
+
+      # ══ #8：漂移 → 试合并 → 取底包 → 触发构建 ════════════════════════════════
+      # 四步的顺序本身就是判据，不是风格：
+      #   ① 试合并 —— 冲突就**到此为止**：不取底包、不派发、不留半成品（实现决定 2）；
+      #   ② 取底包 —— **整条通道只取一次**，两个 build job 共用这一份（实现决定 4）；
+      #      两个 job 各自「现拉最新」的话，官网恰好跨期就会产出不同的字节 —— 那是**假失败**；
+      #   ③ 传 artifact —— build 那边靠 `base_run_id` + `base_artifact` 取回**同一份**；
+      #   ④ 派发构建 —— 用仓库自带的 `GITHUB_TOKEN`（不是 PAT），并把上游提交 / 合并基点 /
+      #      合并提交 / 底包 sha256 **一起传过去**（`trigger-build.py --require` 拦空值）。
+      - name: "试合并：把上游合进本线（绝不 push）"
+        id: merge
+        if: steps.detect.outputs.state == 'drifted'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # ⚠️ `--merge-base` 传的是**API 给出的**那个（不是本地算的）：浅历史里
+          #    `git merge-base` 只会返回它还看得见的那一个，拿截断的祖先去合并会得到
+          #    一次**不报错的错合并**。工具会断言两者相等。
+          python3 .github/scripts/try-merge.py \
+            --repo-dir . \
+            --work-branch "$WORK_BRANCH" \
+            --local-sha "${{ steps.detect.outputs.local_sha }}" \
+            --upstream-url "https://github.com/${UPSTREAM_REPO}.git" \
+            --upstream-sha "${{ steps.detect.outputs.upstream_sha }}" \
+            --merge-base "${{ steps.detect.outputs.merge_base }}" \
+            --github-output "$GITHUB_OUTPUT" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+          # ★ 验收「运行前后**工作分支完全不变**」——**当场复核**，不是一句承诺。
+          #   试合并跑在 detached HEAD 上（工具自己摘的），这一句是它的反面证据：
+          #   远端那条分支的 sha 必须仍等于检测器开头读到的那一个。
+          NOW="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$WORK_BRANCH" --jq .object.sha)"
+          BEFORE="${{ steps.detect.outputs.local_sha }}"
+          if [ "$NOW" != "$BEFORE" ]; then
+            echo "❌ 工作分支 $WORK_BRANCH 动了：$BEFORE → $NOW"
+            echo "   「试合并绝不碰工作分支」是这条通道的硬约束（规格实现决定 2 与 10）。"
+            exit 1
+          fi
+          echo "✅ 复核：$WORK_BRANCH 仍是 $NOW —— 试合并一个字节都没动它"
+          { echo ""; echo "### 试合并（#8）"; echo ""
+            echo "- 合并提交 \`${{ steps.merge.outputs.merge_sha }}\`（父 = 本线 HEAD + 上游提交）"
+            echo "- 工作分支 \`$WORK_BRANCH\` 复核后仍是 \`$NOW\` —— **没动**"
+            echo "- 复核用 \`gh api\`读远端 ref（不是读本地）——本地那条分支本来就不是判据"; } \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "取底包：**整条通道只取一次**，两个 build job 共用这一份"
+        if: steps.detect.outputs.state == 'drifted'
+        run: |
+          set -euo pipefail
+          # ⚠️ 现拉**官方最新**一期（规格实现决定 4）。期次不钉死是**故意**的：
+          #    「每次现拉最新」换来零维护；要钉死的是「两个 build job 用同一份」。
+          python3 .github/scripts/fetch-base.py --latest --out base.img | tee base-fetch.log
+          BSHA="$(sha256sum base.img | cut -d' ' -f1)"
+          echo "$BSHA" > base.sha256
+          echo "  实际下载件 sha256 = $BSHA"
+          if ! grep -qF "$BSHA" base-fetch.log; then
+            echo "❌ 取底包那一步记下的 sha256 与实际文件不符。"
+            echo "   实际 $BSHA"; sed -n '1,20p' base-fetch.log; exit 1
+          fi
+          echo "  ✅ 与取底包那一步记的那一行一致"
+          # ⚠️ 这份日志要写成 `fetch-base.py` **同样的三行形状**（期次 / 来源 / 官方 sha256）——
+          #    build 那边的封装链按那个形状解析（`make-provenance.py`），也是复用那条路
+          #    写日志时踩过的坑（2026-09-26）。
+          { echo ""; echo "### 底包（两个 build job 共用这一份）"; echo ""
+            echo '```'; cat base-fetch.log; echo "复算 sha256 $BSHA"; echo '```'
+            echo "⚠️ artifact 90 天后过期；这份底包从此谁也重建不了（规格实现决定 4 的已知代价）。"; } \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # ⚠️ artifact 名里带**合并提交**：build 那边要传的就是这个名字。用 merge_sha 而不是
+      #    run id，是因为「哪一份底包属于哪一次合并」得一眼看得出来。
+      - uses: actions/upload-artifact@v4
+        if: steps.detect.outputs.state == 'drifted'
+        with:
+          name: base-img-${{ steps.merge.outputs.merge_sha }}
+          path: |
+            base.img
+            base-fetch.log
+            base.sha256
+          if-no-files-found: error
+
+      - name: "触发构建器（仓库自带 GITHUB_TOKEN，不用 PAT）"
+        if: steps.detect.outputs.state == 'drifted'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # ★ 六个入参**一个都不能空**：空的 `merge_sha` 会让构建器按「不合并」跑，
+          #   产出一批**没有上游改动**的东西，而那次运行是**绿的** —— 最坏的一种失败。
+          #   `--require` 就是为它设的：缺一个就**一个请求都不发**（退出码 2）。
+          python3 .github/scripts/trigger-build.py \
+            --repo "$GITHUB_REPOSITORY" --workflow "$BUILD_WORKFLOW" --ref "$WORK_BRANCH" \
+            --input upstream_sha="${{ steps.detect.outputs.upstream_sha }}" \
+            --input merge_base="${{ steps.detect.outputs.merge_base }}" \
+            --input merge_sha="${{ steps.merge.outputs.merge_sha }}" \
+            --input base_run_id="${{ github.run_id }}" \
+            --input base_artifact="base-img-${{ steps.merge.outputs.merge_sha }}" \
+            --input base_sha256="$(cat base.sha256)" \
+            --require upstream_sha --require merge_sha --require merge_base \
+            --require base_run_id --require base_artifact --require base_sha256
+          { echo ""; echo "### 触发构建"; echo ""
+            echo "已派发 \`$BUILD_WORKFLOW\` @ \`$WORK_BRANCH\`（用仓库自带的 \`GITHUB_TOKEN\`）。"
+            echo ""
+            echo "⚠️ 派发接口**不返回 run id** —— 「哪一次」按时间 + 输入里的 \`merge_sha\` 对。"
+            echo "⚠️ 本通道**只出 CI artifact，不碰 release**（发布仍由人手动做）。"
+            echo ""; echo "👉 https://github.com/$GITHUB_REPOSITORY/actions/workflows/$BUILD_WORKFLOW"; } \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # ⚠️ 这一条是给 #9 的地基：**全绿才推分支**。本次运行**没有**任何 push ——
+      #    试合并的结果只活在这个工作区与那个 artifact 里，工作分支仍是检测器开头读到的那个提交。
+      - name: "收尾复核：本次运行没有推进工作分支（#9 才做那件事）"
+        if: steps.detect.outputs.state == 'drifted'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NOW="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$WORK_BRANCH" --jq .object.sha)"
+          BEFORE="${{ steps.detect.outputs.local_sha }}"
+          [ "$NOW" = "$BEFORE" ] || {
+            echo "❌ 工作分支 $WORK_BRANCH 从 $BEFORE 变成了 $NOW"
+            echo "   本工单（#8）**只试合并不推分支**；推分支是 #9，且必须是构建全绿之后。"
+            exit 1
+          }
+          echo "✅ 工作分支仍是 $NOW —— 「分支 = 可发布状态」这个不变量今天没有被破"
+          { echo ""; echo "### 收尾"; echo ""
+            echo "✅ \`$WORK_BRANCH\` 从头到尾是 \`$NOW\` —— 本次运行**一个字节都没推**。"
+            echo "（推分支是 #9：构建全绿之后才推。）"; } >> "$GITHUB_STEP_SUMMARY"
