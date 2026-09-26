@@ -454,7 +454,11 @@ def run(a, api, log=print, now_utc=None):
         "merge_base": cmp["merge_base_commit"]["sha"],
         "behind_by": cmp.get("behind_by"), "ahead_by": cmp.get("ahead_by"),
         "marker": oc.marker, "marker_note": oc.marker_note,
-        "heartbeat_branch": a.heartbeat_branch, "heartbeat_branch_exists": bool(branch_sha),
+        # ⚠️ 叫 `_existed` 而不是 `_exists`：它记的是**读的那一刻**在不在 —— 本次运行
+        #    刚把分支建出来时它照样是 false。名字写成 `_exists` 会让下游（#8/#10）
+        #    在「首次心跳刚建出分支」那一轮读到 false，然后去猜它到底存不存在。
+        "heartbeat_branch": a.heartbeat_branch,
+        "heartbeat_branch_existed": bool(branch_sha),
         "state_path": a.state_path,
         "heartbeat_due": bool(oc.heartbeat_due), "heartbeat_written": written,
         "heartbeat_how": how, "heartbeat_skip": skip, "heartbeat_note": note,
@@ -816,7 +820,7 @@ def main(argv):
         with open(a.github_output, "a", encoding="utf-8", newline="\n") as f:
             for k in ("state", "exit_code", "heartbeat_due", "heartbeat_written",
                       "upstream_sha", "local_sha", "merge_base", "behind_by", "ahead_by",
-                      "heartbeat_branch_exists", "dry_run"):
+                      "heartbeat_branch_existed", "dry_run"):
                 f.write("%s=%s\n" % (k, str(r[k]).lower()))
     if a.summary:
         with open(a.summary, "a", encoding="utf-8", newline="\n") as f:
