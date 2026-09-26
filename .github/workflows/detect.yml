@@ -203,9 +203,13 @@ jobs:
       #   ③ 传 artifact —— build 那边靠 `base_run_id` + `base_artifact` 取回**同一份**；
       #   ④ 派发构建 —— 用仓库自带的 `GITHUB_TOKEN`（不是 PAT），并把上游提交 / 合并基点 /
       #      合并提交 / 底包 sha256 **一起传过去**（`trigger-build.py --require` 拦空值）。
+      #
+      # ⚠️ 四步都额外挂了 `inputs.dry_run != 'true'`：`dry_run` 的语义是**演练**，
+      #    而一次演练顺带触发 30 分钟 × 2 的编译 + 一次上传，不是演练该有的后果。
+      #    （定时触发时 `inputs.dry_run` 是 null ⇒ 条件成立，照常走。）
       - name: "试合并：把上游合进本线（绝不 push）"
         id: merge
-        if: steps.detect.outputs.state == 'drifted'
+        if: steps.detect.outputs.state == 'drifted' && inputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -234,14 +238,19 @@ jobs:
             exit 1
           fi
           echo "✅ 复核：$WORK_BRANCH 仍是 $NOW —— 试合并一个字节都没动它"
+          # ⚠️ 摘要里**必须用 shell 变量**，不能用 `${{ steps.merge.outputs.* }}` ——
+          #    一个 step **自己的** outputs 要等它跑完才存在，在同一 step 里引用会渲染成**空**。
+          #    （实测踩到：第一版这里写出了「合并提交 ``（父 = ...）」这种空值，
+          #      而这行摘要正是人唯一会看的东西。）
+          MSHA="$(git rev-parse HEAD)"
           { echo ""; echo "### 试合并（#8）"; echo ""
-            echo "- 合并提交 \`${{ steps.merge.outputs.merge_sha }}\`（父 = 本线 HEAD + 上游提交）"
+            echo "- 合并提交 \`$MSHA\`（父 = 本线 HEAD \`$BEFORE\` + 上游提交）"
             echo "- 工作分支 \`$WORK_BRANCH\` 复核后仍是 \`$NOW\` —— **没动**"
-            echo "- 复核用 \`gh api\`读远端 ref（不是读本地）——本地那条分支本来就不是判据"; } \
+            echo "- 复核用 \`gh api\` 读**远端** ref（不是读本地）——本地那条分支本来就不是判据"; } \
             >> "$GITHUB_STEP_SUMMARY"
 
       - name: "取底包：**整条通道只取一次**，两个 build job 共用这一份"
-        if: steps.detect.outputs.state == 'drifted'
+        if: steps.detect.outputs.state == 'drifted' && inputs.dry_run != 'true'
         run: |
           set -euo pipefail
           # ⚠️ 现拉**官方最新**一期（规格实现决定 4）。期次不钉死是**故意**的：
@@ -266,7 +275,7 @@ jobs:
       # ⚠️ artifact 名里带**合并提交**：build 那边要传的就是这个名字。用 merge_sha 而不是
       #    run id，是因为「哪一份底包属于哪一次合并」得一眼看得出来。
       - uses: actions/upload-artifact@v4
-        if: steps.detect.outputs.state == 'drifted'
+        if: steps.detect.outputs.state == 'drifted' && inputs.dry_run != 'true'
         with:
           name: base-img-${{ steps.merge.outputs.merge_sha }}
           path: |
@@ -276,7 +285,7 @@ jobs:
           if-no-files-found: error
 
       - name: "触发构建器（仓库自带 GITHUB_TOKEN，不用 PAT）"
-        if: steps.detect.outputs.state == 'drifted'
+        if: steps.detect.outputs.state == 'drifted' && inputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -305,7 +314,7 @@ jobs:
       # ⚠️ 这一条是给 #9 的地基：**全绿才推分支**。本次运行**没有**任何 push ——
       #    试合并的结果只活在这个工作区与那个 artifact 里，工作分支仍是检测器开头读到的那个提交。
       - name: "收尾复核：本次运行没有推进工作分支（#9 才做那件事）"
-        if: steps.detect.outputs.state == 'drifted'
+        if: steps.detect.outputs.state == 'drifted' && inputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
