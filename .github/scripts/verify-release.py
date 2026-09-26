@@ -23,6 +23,9 @@
   python tools/verify-release.py <资产目录> --line los [--repro <第二目录>] [--profile <档>]
 
 `--repro` 指向另一次同配方构建的目录，用来验证「两次构建逐字节相同」。
+⚠️ 第六项比的是**产品**：`Image` / `.config` / `System.map` / 壳 / AK3 zip ——
+缺任何一件都判**失败**（「缺了就不比」会让一次不完整的比对看起来像全绿）。
+只出三件套的 artifact 请改用 `tools/repro-compare.py --allow-partial`。
 `--profile` 决定对 CFI/SCS 的期望值：
   `main`（默认）—— Q13 的主线：CFI/SCS **必须关**，LTO 必须开
   `cfi-experiment` —— CFI 实验线：CFI/SCS **必须开**（见 docs/los-line/tickets.md T9）
@@ -323,14 +326,63 @@ LOS_MUST_BE_N = ("CONFIG_CFI_CLANG", "CONFIG_SHADOW_CALL_STACK")
 # CFI 实验线：**反过来** —— 这两个必须开。同一道闸门，按 profile 切换期望值。
 LOS_EXP_MUST_BE_Y = ("CONFIG_CFI_CLANG", "CONFIG_SHADOW_CALL_STACK")
 
+# 第六项（可复现）要比的**产品**：(标签, 精确名集合, 前缀集合, 后缀)。
+# 顺序即报告顺序。两个维度都非空时**必须同时满足** —— 见 `_find_both`。
+REPRO_PRODUCTS = (
+    ("Image", {"Image"}, ("Image-",), ""),
+    (".config", {".config"}, ("config-",), ""),
+    ("System.map", {"System.map"}, (), ""),
+    ("boot.img", (), ("boot-",), ".img"),
+    ("AK3 zip", (), (), ".zip"),
+)
+
 
 def _find(root, exact, prefixes=()):
     """递归找第一个匹配的文件 —— CI artifact 与扁平暂存目录都能用。"""
     for dirpath, _dirs, files in os.walk(root):
         for f in sorted(files):
-            if f in exact or any(f.startswith(p) for p in prefixes):
+            if (exact and f in exact) or (prefixes and any(f.startswith(p) for p in prefixes)):
                 return os.path.join(dirpath, f)
     return None
+
+
+def _find_any(root, exact=(), prefixes=(), suffix=""):
+    """按类型找第一个文件：**后缀**必须满足；名字维度（精确名 **或** 前缀）**给了才判**。
+
+    ⚠️ 为什么不用 `_find`：它的两个条件是**或**。想找壳时写
+    `_find(root, {".img"}, ("boot-",))` 会把 `dtbo.img`（后缀命中）与
+    `boot-foo.txt`（前缀命中）都算成壳 —— 而第六项的判据是「壳也要两份逐字节相同」。
+
+    ⚠️⚠️ **两个名字维度都为空 = 只看后缀**（`AK3 zip` 就是这样：它没有统一前缀）。
+    第一版把这一格写成了 `f in () or any(… for p in ())` ⇒ **恒为假**，
+    于是 `AK3 zip` 永远报「本目录里没有」，而文件就在那里。
+    教训：**「空集合」与「没给条件」是两种意思**，别让它们落到同一个表达式里
+    （同一形状的坑：`PROJECT.md` §7 坑表 #32 那一类「不完整的绿」）。
+    """
+    name_dim = bool(exact or prefixes)
+    for dirpath, _dirs, files in os.walk(root):
+        for f in sorted(files):
+            if suffix and not f.endswith(suffix):
+                continue
+            if not name_dim or f in exact or any(f.startswith(p) for p in prefixes):
+                return os.path.join(dirpath, f)
+    return None
+
+
+def _prov_base_sha(root):
+    """从目录里的 `PROVENANCE.md` 取「底包 sha256」那一行；取不到返回 None。
+
+    只用来**解释**差异（两次用了不同的底包），不参与判定 —— 判定是产品逐字节相同。
+    """
+    p = _find(root, {"PROVENANCE.md"})
+    if not p:
+        return None
+    try:
+        txt = open(p, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None
+    m = re.search(r"\|\s*sha256\s*\|\s*`([0-9a-f]{64})`\s*\|", txt)
+    return m.group(1) if m else None
 
 
 def _cfg_map(path):
@@ -345,13 +397,17 @@ def _cfg_map(path):
     return out
 
 
-def _verdict(fails, skipped=()):
+def _verdict(fails, skipped=(), notes=()):
     """结论行。
 
     ⚠️ `skipped` **必须报出来**：如果「有东西没核」与「核过了」打印同一句 `✅ 全部通过`，
     那份「全绿」就是假的 —— 这正是本项目反复踩的那类陷阱（PROJECT.md §7 坑表 #32、
     `verify-manifest.py` 无参数只查一份那次事故）。跳过的项**不算失败**（部分体检是合法用法），
     但它必须出现在结论里。
+
+    ⚠️ `notes` 与 `skipped` **分栏**：`skipped` = 「没被核」（可能藏着问题），
+    `notes` = 「核过了，附一条解释」（例如两次的底包不是同一份）。把解释塞进「跳过」
+    会让人以为有一项没核 —— 那是同一类误读的另一个方向。
     """
     print("\n" + "=" * 60)
     if fails:
@@ -363,8 +419,12 @@ def _verdict(fails, skipped=()):
         print("✅ 通过 —— ⚠️ 但本次**跳过**了 %d 项，它们**没被核**（不等于通过）：" % len(skipped))
         for x in skipped:
             print("   - " + x)
-        return 0
-    print("✅ 全部通过")
+    else:
+        print("✅ 全部通过")
+    if notes:
+        print("ℹ️ 备注（已核过，只作解释）：")
+        for x in notes:
+            print("   - " + x)
     return 0
 
 
@@ -374,6 +434,7 @@ def los_main(d, repro, profile="main", lto_expect="y"):
     print("资产目录: %s\n" % d)
     fails = []
     skipped = []          # 没核的项 —— 它们要进结论行，见 _verdict 的注释
+    notes = []            # 核过之后的解释（不判定）—— 同样要进结论行，但**分栏**
     must_y = list(LOS_MUST_BE_Y)
     must_n = []
     if profile == "cfi-experiment":
@@ -513,21 +574,40 @@ def los_main(d, repro, profile="main", lto_expect="y"):
         print("  （未提供 --repro <第二个目录>，跳过）")
         skipped.append("第六项：两次构建逐字节相同（未提供 `--repro`）")
     else:
-        for label, p, ex, pf in (("Image", img, {"Image"}, ("Image-",)),
-                                 (".config", cfg, {".config"}, ("config-",)),
-                                 ("System.map", smap, {"System.map"}, ())):
-            # 按**种类**找而不是按文件名找 —— 发布暂存目录里的名字与 CI artifact 里的不同
-            q = _find(repro, ex, pf)
-            if not q:
-                fails.append("--repro 目录里找不到 %s" % label)
-                print("  %-12s ❌ 第二个目录里没有同名文件" % label)
+        # ⚠️ **比的是「产品」，不是「三件套」**（2026-09-26，issue #6 扩的）。
+        #    原来只比 Image / .config / System.map ⇒ 壳与 zip 的差异**永远不会被发现**，
+        #    而「两次编译产出的字节」这件事恰恰是 issue #6 的判据。补上后，
+        #    「两次构建用了不同的底包」这类错误会在这一项当场现形。
+        # ⚠️ 逐字节 = sha256 相等（sha256 相等当且仅当字节相同）。文件名**不参与**比对：
+        #    两次构建的 Image 名字里带提交短 sha；真按名字比，命名规则一变就会报「缺件」
+        #    而不是「不同」——那是另一种「不完整的红」。
+        for label, ex, pf, sfx in REPRO_PRODUCTS:
+            p1 = _find_any(d, ex, pf, sfx)
+            p2 = _find_any(repro, ex, pf, sfx)
+            if not p1 or not p2:
+                miss = "本目录" if not p1 else "`--repro` 目录"
+                fails.append("第六项：%s 在%s里没有" % (label, miss))
+                print("  %-12s ❌ %s 里没有" % (label, miss))
                 continue
-            h1, h2 = sha256_file(p), sha256_file(q)
+            h1, h2 = sha256_file(p1), sha256_file(p2)
             if h1 != h2:
-                fails.append("%s 两次构建不同" % label)
+                fails.append("第六项：%s 两次构建不同" % label)
             print("  %-12s %s  %s" % (label, "✅" if h1 == h2 else "❌", h1[:32]))
 
-    return _verdict(fails, skipped)
+        # 底包是不是同一份：**不判失败**（比得出不同就已经失败了），但它是最常见的
+        # 「看着像不可复现、其实是换了输入」的原因 ⇒ 单独报一句，省掉一次误诊断。
+        # ⚠️ 它进的是 `notes` 而不是 `skipped`：`skipped` 的语义是「**没被核**」，
+        #    而这一条恰恰是**核过之后**的观察。两者混在一栏里会让人误读（坑表 #32 同源）。
+        b1, b2 = _prov_base_sha(d), _prov_base_sha(repro)
+        if b1 and b2 and b1 != b2:
+            print("  ⚠️ 两次的底包不是同一份：%s… vs %s… —— 上面那些差异是它的必然结果"
+                  % (b1[:12], b2[:12]))
+            notes.append("两次的底包不是同一份（%s… vs %s…）—— 那是上面那些差异的必然来源，"
+                         "不是「同输入却编出不同字节」" % (b1[:12], b2[:12]))
+        elif b1 and b1 == b2:
+            print("  底包同一份：%s" % b1[:32])
+
+    return _verdict(fails, skipped, notes)
 
 
 if __name__ == "__main__":

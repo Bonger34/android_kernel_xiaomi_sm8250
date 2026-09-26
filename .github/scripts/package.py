@@ -261,7 +261,9 @@ def main(argv):
               #    写成「闸门通过」就会让一份失败的 artifact 自称通过。
               "--gate", "✅ **预检**通过（`verify-release.py --line los --profile %s`，退出码 0）。"
                         "本文件写于预检之后、**终检之前** —— 整条链的最终结论看 CI run 的状态。"
-                        "第六项「两次构建逐字节比对」本次跳过，见第四节。" % profile]
+                        "第六项「两次构建逐字节比对」在**另一个 job** 里做（issue #6）："
+                        "本批次由另一次**独立 runner** 上的同配方编译对照，结论见 CI run 摘要。"
+                        % profile]
              + (["--fetch-log", a.fetch_log] if a.fetch_log else []))
     if rc:
         return rc

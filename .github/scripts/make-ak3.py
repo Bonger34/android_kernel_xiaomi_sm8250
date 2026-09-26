@@ -156,6 +156,15 @@ def main(argv):
             zi = zipfile.ZipInfo(name, date_time=ZIP_EPOCH)   # 固定时间戳 → 可复现
             zi.external_attr = (mode & 0xFFFF) << 16
             zi.compress_type = zipfile.ZIP_DEFLATED
+            # ⚠️ 必须**显式**钉住 `create_system`：`zipfile` 默认按宿主平台填它
+            #    （`sys.platform == 'win32'` ⇒ 0，否则 3），而它落在**中央目录的
+            #    `version made by` 字段**里 ⇒ 同一份输入在 Windows 与 Linux 上产出的
+            #    zip **不是同一串字节**（实测差 18 个字节，2026-09-26 踩到：
+            #    本机 3.10.11/Windows 给 0x0014，CI 3.10.12/Ubuntu 给 0x0314）。
+            #    CI 跑在 Linux，所以取 3 —— 与**已发布批次**一致（那批就是 CI 产出的），
+            #    本机 Windows 上跑出来的也就与它逐字节相同了。
+            #    见 PROJECT.md §7 坑表 #36。
+            zi.create_system = 3
             z.writestr(zi, data)
 
     # 自检：回读 zip，核对结构与权限
@@ -179,6 +188,18 @@ def main(argv):
                 if not ok:
                     fails.append("%s 权限 %o != 755" % (n, got[n]))
                 print("  %-52s %s 权限 %o" % (n, "✅" if ok else "❌", got[n]))
+        # ⚠️ 字节级可复现的两项：`version made by` 里的宿主字节必须钉死，
+        #    而 `version needed` 必须仍是 20（`zipfile` 会按压缩方式抬高它，
+        #    一旦抬高，zip 的字节就跟着变）。见上面 `create_system` 的注释。
+        for i in z.infolist()[:1]:
+            ok = (i.create_system, i.create_version, i.extract_version) == (3, 20, 20)
+            if not ok:
+                fails.append("zip 头部没有钉住：create_system=%d create_version=%d "
+                             "extract_version=%d（应为 3/20/20）"
+                             % (i.create_system, i.create_version, i.extract_version))
+            print("  %-52s %s create_system=%d create_version=%d extract_version=%d"
+                  % ("zip 头部与宿主平台无关", "✅" if ok else "❌",
+                     i.create_system, i.create_version, i.extract_version))
         if "Image" in names:
             same = hashlib.sha256(z.read("Image")).hexdigest() == ksha
             if not same:

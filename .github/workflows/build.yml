@@ -23,7 +23,11 @@ on:
         required: false
         default: "false"
       base_date:
-        description: "底包期次 YYYY-MM-DD（留空 = 现拉官方最新一期，见规格实现决定 4）"
+        description: "底包期次 YYYY-MM-DD（留空 = 现拉官方最新一期，见规格实现决定 4）。⚠️ 官方只留最近 3 期；**钉住期次**才是「两次构建逐字节相同」的可信前提"
+        required: false
+        default: ""
+      base_artifact:
+        description: "复用别处上传的底包 artifact（留空 = 本次自己取）。两次构建必须共用同一份底包，见规格实现决定 4"
         required: false
         default: ""
       upstream_sha:
@@ -31,24 +35,32 @@ on:
         required: false
         default: ""
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  两次构建逐字节比对（issue #6，规格实现决定 5 与用户故事 12）
+#
+#  拓扑：prepare（哨兵 + 取一次底包） → build ×2（两个独立 runner，max-parallel=1）
+#        → repro（比对 + 闸门第六项 + 运行摘要）
+#
+#  ⚠️ 三条不许动的约束，每一条都直接对应一条验收：
+#   ① **底包只取一次，由 prepare 分发**。两次各自「现拉最新」的话，官网恰好跨期
+#      就会产出**不同的字节**，而那是**假失败**（规格实现决定 4 的原话）。
+#      也正因为共用这一份，两个 job 之间才**只有底包**这一个共享输入。
+#   ② **两次编译必须落在两个 runner 上**（`max-parallel: 1`）。同一 runner 上连着跑两次
+#      会共享 ccache / 临时目录 / 时钟，比对的就不是「独立编译」了。
+#   ③ **失败也要把两份产物都留下来**（`if: always()`）。比对失败时，产物本身就是诊断材料。
+#
+#  ⚠️ 判定入口没有变：仍是 `verify-release.py --line los --repro <第二目录>`（接缝 S1）。
+#     `repro-compare.py` 只负责**取证**（差异落在哪个文件、哪一段）与**写摘要**，
+#     它不取代闸门 —— 「谁说了算」只有一个答案。
+# ══════════════════════════════════════════════════════════════════════════════
+
 jobs:
-  build:
+  # ══ 准备：环境哨兵 + 取一次底包 ═══════════════════════════════════════════════
+  # 哨兵放在这里（而不是每个 build 里）的理由：它失败就**根本不该开始编译**，
+  # 一次 15 分钟 × 2。它验的是环境（zlib/python），与「哪个 job 在跑」无关。
+  prepare:
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
-    env:
-      # ── 可复现构建：三个变量必须固定 ──────────────────────────────────
-      # scripts/mkcompile_h L37-51：不设则退回 `date` / `whoami` / `uname -n`，
-      # 而 GitHub runner 的主机名每次随机 ⇒ 两次构建的 uname -v 与 banner 必不同。
-      TZ: UTC
-      KBUILD_BUILD_USER: bonger
-      KBUILD_BUILD_HOST: github-actions
-      # ── 封装链用到的 AK3 模板钉值（issue #5）────────────────────────────
-      # ⚠️ 上游 `osm0sis/AnyKernel3@master` 是**会动**的：它变了，zip 的字节就会变
-      #    （anykernel.sh 的内容与 tools/magiskboot 都会进 zip）。钉住 ⇒ 上游一改版
-      #    **当场失败**，而不是悄悄产出一批用别的模板做的 zip。
-      #    要接受新模板就改这一行 —— 那是**人的决定**，不该由构建代劳。
-      AK3_TEMPLATE_URL: https://codeload.github.com/osm0sis/AnyKernel3/tar.gz/refs/heads/master
-      AK3_TEMPLATE_SHA256: a74f8acd2a0855460e16c31a79db344b22c22f082432d946d2db3c727f59a921
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -131,6 +143,111 @@ jobs:
           echo "✅ 环境哨兵通过：本 runner 的重打包环境与已发布件逐字节一致"
           echo "   复算件 sentinel/boot.img sha256 = $(sha256sum sentinel/boot.img | cut -d' ' -f1)"
 
+      # ── 取底包：**整条运行只取一次**，两个 build job 共用这一份 ────────────────
+      # ⚠️ 这是「两次构建**不共享底包以外的任何输入**」这句验收的落地方式：
+      #   底包是**唯一**被共享的输入（它本身就是产物不可复现的天然来源之一 —— 换一期就换字节），
+      #   其余一切（checkout、工具链、模板）都在各自的 job 里独立取得。
+      # ⚠️ 为什么必须由 job 分发而不是「两次各拉最新」：官网每周换一期，两次相隔几分钟，
+      #   恰好跨期就会产出**不同的字节** —— 而那是**假失败**（规格实现决定 4）。
+      - name: "Fetch LineageOS base boot.img (once per run, shared by both builds)"
+        env:
+          BASE_DATE: ${{ inputs.base_date }}
+          BASE_ARTIFACT: ${{ inputs.base_artifact }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -n "$BASE_ARTIFACT" ]; then
+            echo "⚠️ 复用别处上传的底包 artifact：$BASE_ARTIFACT（本次不联网取底包）"
+            gh run download "$BASE_ARTIFACT" -D reused-base -R "${{ github.repository }}"
+            BASE="$(find reused-base -name 'base*.img' | head -1)"
+            [ -n "$BASE" ] || { echo "❌ $BASE_ARTIFACT 里找不到 base*.img"; exit 1; }
+            cp "$BASE" base.img
+            { echo "期次   （复用 artifact $BASE_ARTIFACT）"
+              echo "来源   artifact:$BASE_ARTIFACT"
+              echo "官方   $(stat -c%s base.img) 字节  sha256 $(sha256sum base.img | cut -d' ' -f1)"
+            } > base-fetch.log
+            echo "  复算件 base.img sha256 = $(sha256sum base.img | cut -d' ' -f1)"
+            exit 0
+          fi
+          ARGS="--latest"
+          if [ -n "$BASE_DATE" ]; then
+            ARGS="--date $BASE_DATE"
+            echo "  ⚠️ 期次被 input 钉住：$BASE_DATE（默认是现拉最新）"
+          fi
+          python3 .github/scripts/fetch-base.py $ARGS --out base.img | tee base-fetch.log
+          echo "  复算件 base.img sha256 = $(sha256sum base.img | cut -d' ' -f1)"
+
+      # ⚠️ 独立复算：**用另一个工具**（sha256sum，不是 python）再算一遍底包。
+      #    这一步是为两次构建准备输入 —— 输入的哈希必须在两个 job 之**前**就定下来，
+      #    否则「两份产物用了同一份底包」只是口头约定。
+      - name: "Record the base sha256 (the one input both builds will share)"
+        run: |
+          set -euo pipefail
+          GOT="$(sha256sum base.img | cut -d' ' -f1)"
+          echo "  实际下载件 sha256 = $GOT"
+          if ! grep -qF "$GOT" base-fetch.log; then
+            echo "❌ 取底包那一步记下的 sha256 与实际文件不符。"
+            echo "   实际 $GOT"
+            sed -n '1,20p' base-fetch.log
+            exit 1
+          fi
+          echo "  ✅ 与取底包那一步记的那一行一致"
+          echo "$GOT" > base.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: base-img-${{ github.sha }}
+          path: |
+            base.img
+            base-fetch.log
+            base.sha256
+          if-no-files-found: error
+
+  # ══ 编译 ×2：两个独立 runner，串行（见文件头约束 ②）═══════════════════════════
+  build:
+    needs: prepare
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    strategy:
+      # ⚠️ max-parallel=1 是**故意的**：两次编译必须落在**两个不同的 runner** 上
+      #    （并行也行，但那要多占一份并发额度；串行的总时长仍在那条 3 小时的超时内）。
+      #    同一 runner 上连着跑两次会共享 ccache / 临时目录 / 时钟 ⇒ 比对的就不是独立编译。
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        pass: [a, b]
+    env:
+      # ── 可复现构建：三个变量必须固定 ──────────────────────────────────
+      # scripts/mkcompile_h L37-51：不设则退回 `date` / `whoami` / `uname -n`，
+      # 而 GitHub runner 的主机名每次随机 ⇒ 两次构建的 uname -v 与 banner 必不同。
+      TZ: UTC
+      KBUILD_BUILD_USER: bonger
+      KBUILD_BUILD_HOST: github-actions
+      # ── 封装链用到的 AK3 模板钉值（issue #5）────────────────────────────
+      # ⚠️ 上游 `osm0sis/AnyKernel3@master` 是**会动**的：它变了，zip 的字节就会变
+      #    （anykernel.sh 的内容与 tools/magiskboot 都会进 zip）。钉住 ⇒ 上游一改版
+      #    **当场失败**，而不是悄悄产出一批用别的模板做的 zip。
+      #    要接受新模板就改这一行 —— 那是**人的决定**，不该由构建代劳。
+      AK3_TEMPLATE_URL: https://codeload.github.com/osm0sis/AnyKernel3/tar.gz/refs/heads/master
+      AK3_TEMPLATE_SHA256: a74f8acd2a0855460e16c31a79db344b22c22f082432d946d2db3c727f59a921
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # 两份编译的输入必须**逐字节相同**。底下是 prepare 算好的那一份，不是各拉各的。
+      - name: "Download the shared base boot.img (the only shared input)"
+        uses: actions/download-artifact@v4
+        with:
+          name: base-img-${{ github.sha }}
+
+      - name: "Show what this pass got"
+        run: |
+          set -euo pipefail
+          ls -l base.img base-fetch.log base.sha256
+          echo "  底包 sha256（prepare 记下的）= $(cat base.sha256)"
+          echo "  本 pass 复算                = $(sha256sum base.img | cut -d' ' -f1)"
+
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
@@ -146,6 +263,7 @@ jobs:
       # ── 可复现构建 ─────────────────────────────────────────────────────
       # ① KBUILD_BUILD_TIMESTAMP 取该提交的提交时间。LOS 侧没有原厂要对齐，
       #    唯一目标是「同一提交两次构建逐字节相同」；不设则 mkcompile_h 用 `date`。
+      #    两次编译检出的是**同一个提交**（同一 run 的 github.sha）⇒ 这个值两份相同。
       # ② kernel/gen_kheaders.sh 的 tar 记录源文件 mtime（= checkout 时刻），压缩后长度每次
       #    不同 —— 实测两次构建差 520 字节，把 kernel_headers_data 之后的约 10MB 整体顶偏
       #    （System.map 里 41,741 行地址随之变化）。SOURCE_DATE_EPOCH 对 GNU tar 无效，须 --mtime。
@@ -214,22 +332,8 @@ jobs:
       #     写成 Python 脚本，同一条链在本机就能跑通 —— 而且本机有已发布批次的输入件，
       #     「重打包出来的 boot.img 与已发布的逐字节相同」是个**强判据**。
       #     workflow 只负责：取底包 → 调它 → 传 artifact。
+      # ⚠️ 底包已由 prepare 取好（`base.img` 就在工作目录里），这里**不再**取。
       # ══════════════════════════════════════════════════════════════════
-
-      # 底包每次都**现拉**（规格实现决定 4）：官方直接单独发布 `boot.img`，不必解 ROM 包。
-      # 输出 tee 进日志 —— 来源说明要记期次与来源 URL，那份日志就是它的输入之一。
-      - name: "Fetch LineageOS base boot.img (input of the whole chain)"
-        env:
-          BASE_DATE: ${{ inputs.base_date }}
-        run: |
-          set -euo pipefail
-          ARGS="--latest"
-          if [ -n "$BASE_DATE" ]; then
-            ARGS="--date $BASE_DATE"
-            echo "  ⚠️ 期次被 input 钉住：$BASE_DATE（默认是现拉最新）"
-          fi
-          python3 .github/scripts/fetch-base.py $ARGS --out base.img | tee base-fetch.log
-          echo "  复算件 base.img sha256 = $(sha256sum base.img | cut -d' ' -f1)"
 
       - name: "Package: repack boot.img + AnyKernel3 + manifest + gate + provenance"
         run: |
@@ -267,9 +371,21 @@ jobs:
           fi
           echo "  ✅ 与 PROVENANCE.md 记的那一行逐字相同"
 
+      # ⚠️ 两次编译的输入必须逐字节相同 —— 这是「两次构建不共享底包以外的输入」的反面。
+      #    把它做成**显式的一步**：两份都比对 prepare 记下的那个哈希，
+      #    于是「两次用的不是同一份底包」会在这里当场失败，而不是在比对那一步变成
+      #    一条难读的「Image 两次构建不同」。
+      - name: "Assert: this pass used the shared base"
+        run: |
+          set -euo pipefail
+          WANT="$(cat base.sha256)"
+          GOT="$(sha256sum base.img | cut -d' ' -f1)"
+          [ "$WANT" = "$GOT" ] || { echo "❌ 本 pass 用的底包不是 prepare 分发的那一份"; exit 1; }
+          echo "  ✅ 底包与 prepare 分发的那一份相同：$GOT"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: kernel-image
+          name: kernel-image-${{ matrix.pass }}
           path: |
             out/arch/arm64/boot/Image
             out/.config
@@ -279,14 +395,88 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
 
-      # ⚠️ `if: always()` 是**故意的**：闸门不过时 job 会失败，但产物仍要留下来供事后诊断
-      #    （规格用户故事 11）。⚠️ 注意此时 dist 里**可能已经有一份 PROVENANCE.md** ——
-      #    它写在**预检之后、终检之前**，所以它记的是「预检通过」而不是整条链的结论。
-      #    这正是那份文件第五节明说「最终结论看 CI run 的状态」的原因。
+      # ⚠️ `if: always()` 是**故意的**：闸门不过、或整条链某一步失败时，产物仍要留下来
+      #    供事后诊断（规格用户故事 11）。⚠️ 注意此时 dist 里**可能已经有一份
+      #    PROVENANCE.md** —— 它写在**预检之后、终检之前**，所以它记的是「预检通过」
+      #    而不是整条链的结论。这正是那份文件第五节明说「最终结论看 CI run 的状态」的原因。
+      # ⚠️ 两次运行各传各的（名字带 `matrix.pass`）：比对失败时**两份都要在**，
+      #    只留一份就永远查不出差异落在哪里。
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: los23.2-umi-${{ github.sha }}
+          name: los23.2-umi-${{ github.sha }}-${{ matrix.pass }}
           path: dist/
           include-hidden-files: true
           if-no-files-found: warn
+
+  # ══ 比对：取证 + 判定 + 运行摘要（issue #6 的核心）═════════════════════════════
+  # ⚠️ `if: always()`：两次编译**任一失败**时这一节照样要跑 ——
+  #    ① 失败的那次仍有 dist（上传那一步是 always）；
+  #    ② 摘要里要说清「这一节为什么没得出结论」，而不是整节消失。
+  repro:
+    needs: [prepare, build]
+    if: always()
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "Download both passes' artifacts (both must survive, even on failure)"
+        uses: actions/download-artifact@v4
+        with:
+          pattern: los23.2-umi-${{ github.sha }}-*
+          path: repro
+        # ⚠️ 不设 continue-on-error：**拿不到两份产物本身就是要报的错**。
+        #    「下载失败所以跳过比对」会让一次没跑成的比对看起来像通过。
+
+      - name: "Show what was downloaded"
+        run: |
+          ls -lR repro | head -40
+          for p in a b; do
+            d="repro/los23.2-umi-${{ github.sha }}-$p"
+            if [ ! -d "$d" ]; then
+              echo "❌ 缺少 pass $p 的产物目录：$d —— 比对无从谈起。"
+              echo "   两份产物都要留下（上传那一步是 if: always()）；缺一份就说明它没产出。"
+              exit 1
+            fi
+            n=$(find "$d" -type f | wc -l)
+            [ "$n" -gt 0 ] || { echo "❌ pass $p 的产物目录是空的"; exit 1; }
+            echo "  pass $p：$n 个文件"
+          done
+
+      # ★ 取证：逐字节比两份，并把报告写进运行摘要（`$GITHUB_STEP_SUMMARY`）。
+      #   ⚠️ 这一步**故意不因差异而红** —— 判定归闸门（下一步）；
+      #      它失败时这一步仍会把「差异落在哪个字节」写进摘要并打印出来。
+      - name: "Byte-for-byte comparison → run summary"
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/repro-compare.py \
+            "repro/los23.2-umi-${{ github.sha }}-a" \
+            "repro/los23.2-umi-${{ github.sha }}-b" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      # ★ 判定：闸门第六项（接缝 S1 —— 「这批产物能不能发」的唯一入口）。
+      #   ⚠️ **先写摘要再退非零**：`run:` 一旦非零，后面的步骤就不跑了，
+      #      而「不一致时摘要里也要看得见」正是上面那一步的全部用途。
+      #      （同一形状的教训：PROJECT.md §7 坑表 #34 —— 早写下的结论会被晚发生的事推翻。）
+      - name: "Gate: verify-release.py --line los --repro (the only verdict)"
+        run: |
+          set +e
+          python3 .github/scripts/verify-release.py \
+            "repro/los23.2-umi-${{ github.sha }}-a" \
+            --line los --repro "repro/los23.2-umi-${{ github.sha }}-b"
+          RC=$?
+          {
+            echo ""
+            echo "## 判定（接缝 S1）"
+            echo ""
+            echo '```'
+            echo "verify-release.py --line los --repro  →  exit $RC"
+            echo '```'
+            echo ""
+            echo "闸门是**唯一**的判定入口；上面的逐字节报告只负责取证。"
+            echo "退出码 0 = 两次构建逐字节相同（且三件套、KSU 符号、同源、哈希清单都过）。"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $RC
