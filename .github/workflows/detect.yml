@@ -123,6 +123,25 @@ jobs:
           if [ -f detect.json ]; then cat detect.json
           else echo "（没有 detect.json —— 检测器没走到写它的那一步）"; fi
           echo "───────────────────────────────────────────────"
+
+          # ⚠️ **运行摘要**是这条通道唯一被人读的东西（一天一次，没人会去翻日志），
+          #    而「它写没写成功」在界面上**看不出来**：摘要为空时那次运行照样是绿的。
+          #    ⇒ 把「非空」做成一道检查，并把内容打进日志 —— 于是它可核验、也留得下证据。
+          #
+          # 🚨 **必须在本步之内查**：`$GITHUB_STEP_SUMMARY`（以及 `GITHUB_OUTPUT`）是
+          #    **每个 step 一个**的临时文件，runner 在这一步**结束后**才把它并进 job summary
+          #    ⇒ 下一步读它是**空的**。第一版把它写成后面单独一步，于是它**必然失败**
+          #    （实测：run 36263004895 红在那一句上）。这一类「只在 CI 上出现」的错误
+          #    与坑表 #37 同族：本机没有 runners 的 step 概念，跑不出来。
+          if [ ! -s "$GITHUB_STEP_SUMMARY" ]; then
+            echo "❌ 运行摘要为空 —— detect.py 的 --summary 没写成功，而运行照样会是绿的"
+            exit 1
+          fi
+          echo "运行摘要 $(wc -c < "$GITHUB_STEP_SUMMARY") 字节，逐字如下："
+          echo "┌───────────────────────────────────────────────"
+          cat "$GITHUB_STEP_SUMMARY"
+          echo "└───────────────────────────────────────────────"
+
           if [ "$RC" = "10" ]; then
             echo "::notice::检测到上游漂移 —— 本工单只发现、不构建（触发构建是 issue #8）"
           fi
@@ -151,21 +170,3 @@ jobs:
           echo "merge_base = ${{ steps.detect.outputs.merge_base }}"
           echo "心跳       = 到期 ${{ steps.detect.outputs.heartbeat_due }} / 已写 ${{ steps.detect.outputs.heartbeat_written }}"
           echo "（本工单到此为止：无漂移、有漂移都不构建 —— 那是 #8）"
-
-      # ⚠️ **运行摘要**是这条通道唯一被人读的东西（一天一次，没人会去翻日志），
-      #    而它「写没写成功」在界面上**看不出来**：摘要为空时那次运行照样是绿的。
-      #    ⇒ 把「非空」做成一道检查，并把内容打进日志 —— 于是它可核验、也留得下证据
-      #    （`$GITHUB_STEP_SUMMARY` 是**每个 job 一个**的文件，前面的步骤往里追加，
-      #      这里读到的是累积后的全文）。
-      - name: "检查运行摘要非空（人打开这次运行就看它）"
-        run: |
-          set -euo pipefail
-          if [ ! -s "$GITHUB_STEP_SUMMARY" ]; then
-            echo "❌ \$GITHUB_STEP_SUMMARY 是空的 —— 摘要没写成功，而运行照样是绿的"
-            echo "   （detect.py 的 --summary 参数写的就是这个文件）"
-            exit 1
-          fi
-          echo "运行摘要 $(wc -c < "$GITHUB_STEP_SUMMARY") 字节，逐字如下："
-          echo "┌─────────────────────────────────────────────"
-          cat "$GITHUB_STEP_SUMMARY"
-          echo "└─────────────────────────────────────────────"
