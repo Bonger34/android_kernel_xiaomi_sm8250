@@ -147,6 +147,11 @@ def main(argv):
                          "#8 起由检测器传入，手动触发时为空 —— 那时来源说明如实写「未记录」）")
     ap.add_argument("--run-url", default="")
     ap.add_argument("--fetch-log", default=None)
+    ap.add_argument("--repro", default=(
+        "本批次由**另一个 job** 在**另一个独立 runner** 上同配方编译一次并逐字节比对"
+        "（**issue #6**；报告见该 CI run 的运行摘要，判定见闸门第六项）——"
+        " 本文件写于那次比对**之前**，所以这里写不出它的结论（同一形状的教训见 `PROJECT.md` §7 坑表 #34）。"),
+        help="写进来源说明第四节「可复现」的文字（默认描述 issue #6 的两 job 拓扑）")
     ap.add_argument("--line-name", default="LOS23.2", help="命名里的线名")
     ap.add_argument("--ksu-version", default="0.9.5")
     ap.add_argument("--device", default="umi")
@@ -256,6 +261,11 @@ def main(argv):
               "--repo", a.repo, "--branch", a.branch, "--commit", a.commit,
               "--run-url", a.run_url,
               "--upstream-sha", a.upstream_sha,
+              # ⚠️ 第四节「可复现」要写**这一批实际是怎么比的**（issue #6 起是两个独立
+              #    runner）。原来不传 ⇒ 落在 make-provenance.py 的默认串上，
+              #    而那句写的是「由 issue #6 负责」—— 现在这件事**已经做了**，
+              #    留着就是一句过时的话（artifact 会一直带着它）。
+              "--repro", a.repro,
               # ⚠️ 措辞必须说清这是**哪一遍**闸门的结论：本文件写在预检之后、终检**之前**，
               #    而终检失败时它已经落盘、还会随失败产物一起被上传（`if: always()`）。
               #    写成「闸门通过」就会让一份失败的 artifact 自称通过。
