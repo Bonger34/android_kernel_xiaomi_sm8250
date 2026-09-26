@@ -47,7 +47,12 @@ python tools/fetch-base.py --latest --out stock-boot-los/boot_LOS23.2-20260920.i
 python tools/fetch-base.py --latest --expect-sha256 <已记录的值>   # 额外的外部钉值
 ```
 
-退出码：0 = 成功；1 = 取不到 / 校验不符；2 = 用法错误；3 = 网络失败（重试用尽）。
+退出码：0 = 成功；1 = 取不到 / 校验不符 / 该资源不存在（4xx）；2 = 用法错误；3 = 网络失败（重试用尽）。
+
+⚠️ **本文件有**两份，必须逐字节相同**：工作区的 `tools/fetch-base.py`，与 LOS 工作仓库里的
+`.github/scripts/fetch-base.py`（CI 跑**后者** —— 内核树自带一个 `tools/`，那是上游的，
+项目自己的 CI 工具一律放 `.github/`，同 `repack-boot.py`）。
+镜像与复验：`python tools/sync-ci-scripts.py --gen` / `--check`（改一份就同步改另一份）。
 """
 
 import argparse
@@ -60,7 +65,7 @@ import time
 import urllib.error
 import urllib.request
 
-DEVICE = "umi"
+DEFAULT_DEVICE = "umi"
 API = "https://download.lineageos.org/api/v2/devices/%s/builds"
 MIRROR = "https://mirrorbits.lineageos.org"
 WANT_FILE = "boot.img"          # 底包就是这一份；其余（recovery/dtbo/vbmeta）本工具不取
@@ -68,6 +73,15 @@ WANT_FILE = "boot.img"          # 底包就是这一份；其余（recovery/dtbo
 CHUNK = 1 << 20                 # 1 MiB
 TRIES = 4                       # 每个请求的重试次数（含首次）
 TIMEOUT = 60                    # 单次 urlopen 的超时
+PART, SRC = ".part", ".src"     # 半成品与「它来自哪个 URL」的记号（见 download）
+
+
+class UpstreamMissing(RuntimeError):
+    """上游**明确说没有**（4xx）。
+
+    与「网络失败」分开，是因为善后完全不同：网络失败该重试、该报退出码 3；
+    上游说没有（设备代号打错、期次被清理）重试多少次都一样，该报退出码 1。
+    """
 
 
 def http_get(url, offset=0, timeout=TIMEOUT):
@@ -79,7 +93,7 @@ def http_get(url, offset=0, timeout=TIMEOUT):
 
 
 def fetch_json(url):
-    """取一次元数据。5xx / 网络抖动重试，4xx 直接失败（重试不会变好）。"""
+    """取一次元数据。5xx / 网络抖动重试；4xx 立刻抛 `UpstreamMissing`（重试不会变好）。"""
     last = None
     for i in range(TRIES):
         try:
@@ -87,7 +101,7 @@ def fetch_json(url):
                 return json.loads(r.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             if 400 <= e.code < 500:
-                raise RuntimeError("HTTP %d（不重试）: %s" % (e.code, url))
+                raise UpstreamMissing("HTTP %d: %s" % (e.code, url))
             last = e
         except Exception as e:
             last = e
@@ -125,9 +139,21 @@ def pick(builds, date=None):
     return builds[0] if builds else None
 
 
-def default_out(target_date):
-    """默认输出名：`boot-umi-<YYYYMMDD>.img`（`stock-boot-los/` 里那份的命名同族）。"""
-    return "boot-%s-%s.img" % (DEVICE, (target_date or "unknown").replace("-", ""))
+def default_out(device, target_date):
+    """默认输出名：`boot-<设备>-<YYYYMMDD>.img`（`stock-boot-los/` 里那份的命名同族）。"""
+    return "boot-%s-%s.img" % (device, (target_date or "unknown").replace("-", ""))
+
+
+def part_paths(out_path):
+    """半成品与来源记号的路径。**只有这一处拼后缀** —— 散在多处时总会漏掉一个。"""
+    return out_path + PART, out_path + SRC
+
+
+def drop_partial(out_path):
+    """丢掉半成品与来源记号（`--no-resume`，以及续传判据不成立时）。"""
+    for p in part_paths(out_path):
+        if os.path.exists(p):
+            os.remove(p)
 
 
 def sha256_file(path, upto=None):
@@ -157,14 +183,13 @@ def download(url, out_path, expect_size=None):
     本函数发现 url 变了就**丢弃半成品重下** —— 否则会把两个不同版本的字节拼在一起，
     而且**拼接出来的文件长度可能正好等于期望值**，长度检查拦不住它。
     """
-    part = out_path + ".part"
-    src = out_path + ".src"
+    part, src = part_paths(out_path)
     parent = os.path.dirname(os.path.abspath(out_path))
     if parent:
         os.makedirs(parent, exist_ok=True)      # 输出目录不存在时自己建（别让用户先 mkdir）
     have = file_len(part)
-    prev = None
     if have:
+        prev = None
         try:
             with open(src, "r", encoding="utf-8") as f:
                 prev = f.read().strip()
@@ -172,43 +197,53 @@ def download(url, out_path, expect_size=None):
             prev = None
         if prev != url:
             print("  ⚠️ 半成品来自另一个 URL（%s），丢弃重下" % (prev or "未知"))
-            os.remove(part)
+            drop_partial(out_path)
             have = 0
     if not have:
         with open(src, "w", encoding="utf-8") as f:
             f.write(url + "\n")
 
-    # 进度每 8 MiB 报一次：128 MiB 的包每 MiB 报一次会刷出 128 行，日志没法看
-    step = 8 * CHUNK
-    mark = [have]
-
     for i in range(TRIES):
         try:
-            with http_get(url, offset=have) as r:
-                # 服务器忽略 Range 时会回 200 + 整份内容 ⇒ 必须从头写，不能追加
-                mode = "ab" if (have and r.status == 206) else "wb"
-                if mode == "wb":
-                    have = 0
-                    mark[0] = 0
-                with open(part, mode) as f:
-                    while True:
-                        block = r.read(CHUNK)
-                        if not block:
-                            break
-                        f.write(block)
-                        have += len(block)
-                        if expect_size and have - mark[0] >= step:
-                            mark[0] = have
-                            print("  ... %d / %d 字节 (%.1f%%)"
-                                  % (have, expect_size, 100.0 * have / expect_size))
+            have = _one_pass(url, part, have, expect_size)
             return have
+        except UpstreamMissing:
+            raise                          # 4xx：重试不会变好，直接上抛
         except Exception as e:
             print("  ⚠️ 第 %d 次下载中断于 %d 字节：%s" % (i + 1, have, e))
             have = file_len(part)          # 断在半路：以磁盘上的实际长度为准再续
-            mark[0] = have
             if i + 1 < TRIES:
                 time.sleep(2 * (i + 1))
     raise RuntimeError("下载失败（重试 %d 次用尽），半成品留在 %s" % (TRIES, part))
+
+
+def _one_pass(url, part, have, expect_size):
+    """一次下载尝试，返回落盘字节数。抽出来是为了让重试循环只有一份善后逻辑。"""
+    # 进度每 8 MiB 报一次：128 MiB 的包每 MiB 报一次会刷出 128 行，日志没法看
+    step, mark = 8 * CHUNK, have
+    try:
+        with http_get(url, offset=have) as r:
+            # 服务器忽略 Range 时会回 200 + 整份内容 ⇒ 必须从头写，不能追加
+            mode = "ab" if (have and r.status == 206) else "wb"
+            if mode == "wb":
+                have = mark = 0
+            with open(part, mode) as f:
+                while True:
+                    block = r.read(CHUNK)
+                    if not block:
+                        break
+                    f.write(block)
+                    have += len(block)
+                    if expect_size and have - mark >= step:
+                        mark = have
+                        print("  ... %d / %d 字节 (%.1f%%)"
+                              % (have, expect_size, 100.0 * have / expect_size))
+        return have
+    except urllib.error.HTTPError as e:
+        if 400 <= e.code < 500:
+            # 上游说没有（例如该期次已被清理）—— 重试不会变好，别当成网络问题
+            raise UpstreamMissing("HTTP %d: %s" % (e.code, url))
+        raise
 
 
 def report_failure(target, got_size, got_sha, out_path, url, pins):
@@ -266,7 +301,10 @@ def self_test():
         ("--date 未命中 ⇒ None（不静默换期）", pick(b, "2020-01-01"), None),
         ("API 顺序被打乱也仍然取最新",
          pick(builds_of(list(reversed(doc))))["date"], "2026-09-20"),
-        ("默认输出名", default_out("2026-09-20"), "boot-umi-20260920.img"),
+        ("默认输出名", default_out(DEFAULT_DEVICE, "2026-09-20"), "boot-umi-20260920.img"),
+        ("默认输出名跟着 --device 走（别拿常量拼）",
+         default_out("raven", "2026-09-20"), "boot-raven-20260920.img"),
+        ("半成品与来源记号成对", part_paths("/x/b.img"), ("/x/b.img.part", "/x/b.img.src")),
     ]
     for what, got, want in cases:
         n += 1
@@ -284,7 +322,7 @@ def main(argv):
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(add_help=True, description="取 LineageOS 官方底包（纯 I/O，见文件头注释）")
-    ap.add_argument("--device", default=DEVICE, help="设备代号（默认 umi）")
+    ap.add_argument("--device", default=DEFAULT_DEVICE, help="设备代号（默认 umi）")
     ap.add_argument("--latest", action="store_true", help="取最新一期（默认行为）")
     ap.add_argument("--date", metavar="YYYY-MM-DD", help="取指定日期那一期（官方只留最近 3 期）")
     ap.add_argument("--out", metavar="路径", help="输出路径（默认 boot-<设备>-<YYYYMMDD>.img）")
@@ -309,8 +347,13 @@ def main(argv):
     url_api = API % a.device
     try:
         builds = builds_of(fetch_json(url_api))
+    except UpstreamMissing as e:
+        # 「上游说没有」不是网络故障：重试多少次都一样 ⇒ 退出码 1，不是 3
+        print("上游没有这个设备的构建列表：%s" % e)
+        print("   先核对设备代号：--device 现在是 %r。" % a.device)
+        return 1
     except RuntimeError as e:
-        print("取期次列表失败：%s" % e)
+        print("取期次列表失败（网络）：%s" % e)
         return 3
     if not builds:
         print("官方 API 没有返回任何带 boot.img 的期次：%s" % url_api)
@@ -337,7 +380,7 @@ def main(argv):
         path = src_url.split(MIRROR, 1)[-1] if MIRROR in src_url else src_url
         src_url = a.mirror.rstrip("/") + (path if path.startswith("/") else "/" + path)
 
-    out_path = a.out or default_out(target["date"])
+    out_path = a.out or default_out(a.device, target["date"])
     print("期次   %s" % target["date"])
     print("来源   %s" % src_url)
     print("官方   %d 字节  sha256 %s" % (target["boot"]["size"], target["boot"]["sha256"]))
@@ -348,17 +391,18 @@ def main(argv):
         return 0
 
     if a.no_resume:
-        for suffix in (".part", ".src"):
-            if os.path.exists(out_path + suffix):
-                os.remove(out_path + suffix)
+        drop_partial(out_path)
 
     try:
         got_size = download(src_url, out_path, target["boot"]["size"])
+    except UpstreamMissing as e:
+        print("底包取不到（上游明确说没有）：%s" % e)
+        return 1
     except RuntimeError as e:
-        print("下载失败：%s" % e)
+        print("下载失败（网络）：%s" % e)
         return 3
 
-    part = out_path + ".part"
+    part, src = part_paths(out_path)
     got_sha = sha256_file(part)
     pins = []
     if a.expect_sha256 and got_sha != a.expect_sha256.lower():
@@ -372,9 +416,8 @@ def main(argv):
         return 1
 
     os.replace(part, out_path)          # 只有校验通过才改名 —— 半成品永远不叫正式名
-    for suffix in (".src",):
-        if os.path.exists(out_path + suffix):
-            os.remove(out_path + suffix)
+    if os.path.exists(src):
+        os.remove(src)
     if target.get("epoch"):
         # 把 mtime 钉到官方发布时间：同一期次在任何机器上落成同样的时间戳
         os.utime(out_path, (target["epoch"], target["epoch"]))
