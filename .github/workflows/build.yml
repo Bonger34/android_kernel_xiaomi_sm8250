@@ -26,8 +26,12 @@ on:
         description: "底包期次 YYYY-MM-DD（留空 = 现拉官方最新一期，见规格实现决定 4）。⚠️ 官方只留最近 3 期；**钉住期次**才是「两次构建逐字节相同」的可信前提"
         required: false
         default: ""
+      base_run_id:
+        description: "复用某次 run 的底包：那个 run 的数字 id（与 base_artifact 配对；两个都留空则本次自己取）"
+        required: false
+        default: ""
       base_artifact:
-        description: "复用别处上传的底包 artifact（留空 = 本次自己取）。两次构建必须共用同一份底包，见规格实现决定 4"
+        description: "复用某次 run 的底包：artifact 名（如 base-img-<sha>）。与 base_run_id 配对使用"
         required: false
         default: ""
       upstream_sha:
@@ -61,6 +65,12 @@ jobs:
   prepare:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    # ⚠️ `permissions:` 一旦写了，**没列出的权限一律变 none**。
+    #    `actions: read` 是 `gh api …/actions/runs/<id>/artifacts` 需要的（复用底包那条路）；
+    #    `contents: read` 是 checkout 需要的。少了任何一个都只会在**跑起来之后**才报 403。
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -152,21 +162,68 @@ jobs:
       - name: "Fetch LineageOS base boot.img (once per run, shared by both builds)"
         env:
           BASE_DATE: ${{ inputs.base_date }}
+          BASE_RUN_ID: ${{ inputs.base_run_id }}
           BASE_ARTIFACT: ${{ inputs.base_artifact }}
           GH_TOKEN: ${{ github.token }}
+          # ⚠️ `gh api` 在下面的内联 python 里被调用（下载 artifact 的 zip 要用它带凭据），
+          #    而 python 不好直接拿到 `${{ github.repository }}` ⇒ 走环境变量。
+          GH_REPO: ${{ github.repository }}
+          # ⚠️ `|2` = 「内容相对父级再缩进 2 格」，于是**内容自己顶格**（不带公共缩进）——
+          #    这正是 `python3 -c` 要的形态。用 `|` 的话内容会带着 10 空格缩进，必炸
+          #    （本机实测：`IndentationError: unexpected indent`）。
+          PY_PICK: |2
+            import json
+            import os
+            import subprocess
+            import sys
+            import zipfile
+
+            meta_path, out_dir, want = sys.argv[1], sys.argv[2], sys.argv[3]
+            arts = json.load(open(meta_path, encoding="utf-8")).get("artifacts") or []
+            hit = [a for a in arts if a.get("name") == want]
+            if not hit:
+                sys.stderr.write("这个 run 里没有名为 %r 的 artifact。可用：\n" % want)
+                for a in arts:
+                    sys.stderr.write("   %s\n" % a.get("name"))
+                raise SystemExit(1)
+            aid = max(hit, key=lambda a: a.get("created_at") or "")["id"]
+            with open("artifact.zip", "wb") as f:
+                rc = subprocess.run(["gh", "api", "repos/%s/actions/artifacts/%d/zip"
+                                     % (os.environ["GH_REPO"], aid)], stdout=f).returncode
+            if rc:
+                raise SystemExit("gh api 下载 artifact %d 失败（退出码 %d）" % (aid, rc))
+            os.makedirs(out_dir, exist_ok=True)
+            with zipfile.ZipFile("artifact.zip") as z:
+                z.extractall(out_dir)
+                print("  已取 artifact %d（%s），内含：" % (aid, want))
+                for i in z.infolist():
+                    print("    %s" % i.filename)
         run: |
           set -euo pipefail
-          if [ -n "$BASE_ARTIFACT" ]; then
-            echo "⚠️ 复用别处上传的底包 artifact：$BASE_ARTIFACT（本次不联网取底包）"
-            gh run download "$BASE_ARTIFACT" -D reused-base -R "${{ github.repository }}"
-            BASE="$(find reused-base -name 'base*.img' | head -1)"
+          if [ -n "$BASE_ARTIFACT" ] || [ -n "$BASE_RUN_ID" ]; then
+            # ⚠️ **两个都要给**：artifact 名不是唯一的（同一个 `base-img-<sha>` 可能被重跑
+            #    传过多次，GitHub 存的是**每一次上传**），所以先按 run 缩范围、再挑最新的那个。
+            # ⚠️ 这里两处写法都是**本机实测过**才敢写进来的（2026-09-26，两次踩坑）：
+            #    ① `gh run download <x>` 的第一个参数是 **run id**，不是 artifact 名 ——
+            #       把名字传进去会去请求 `.../runs/<名字>/artifacts` ⇒ 404。
+            #    ② `python3 -c '…'` 里的代码**不能带 YAML 块缩进**（见上面 `PY_PICK`）。
+            [ -n "$BASE_ARTIFACT" ] && [ -n "$BASE_RUN_ID" ] || {
+              echo "❌ base_artifact 与 base_run_id 必须成对给出（只给一个无法定位那一份）"
+              exit 1
+            }
+            echo "⚠️ 复用 run ${BASE_RUN_ID} 的底包 artifact：$BASE_ARTIFACT（本次不联网取底包）"
+            gh api "repos/${{ github.repository }}/actions/runs/${BASE_RUN_ID}/artifacts?per_page=100" \
+              > artifacts-meta.json
+            python3 -c "$PY_PICK" artifacts-meta.json reused-base "$BASE_ARTIFACT"
+            BASE="$(find reused-base -maxdepth 1 -name 'base*.img' | head -1)"
             [ -n "$BASE" ] || { echo "❌ $BASE_ARTIFACT 里找不到 base*.img"; exit 1; }
             cp "$BASE" base.img
-            { echo "期次   （复用 artifact $BASE_ARTIFACT）"
-              echo "来源   artifact:$BASE_ARTIFACT"
-              echo "官方   $(stat -c%s base.img) 字节  sha256 $(sha256sum base.img | cut -d' ' -f1)"
+            BSHA="$(sha256sum base.img | cut -d' ' -f1)"
+            { echo "期次   （复用 artifact：run ${BASE_RUN_ID} 的 $BASE_ARTIFACT）"
+              echo "来源   artifact:${BASE_RUN_ID}/$BASE_ARTIFACT"
+              echo "官方   $(stat -c%s base.img) 字节  sha256 $BSHA"
             } > base-fetch.log
-            echo "  复算件 base.img sha256 = $(sha256sum base.img | cut -d' ' -f1)"
+            echo "  复算件 base.img sha256 = $BSHA"
             exit 0
           fi
           ARGS="--latest"
