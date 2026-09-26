@@ -1,0 +1,16 @@
+# 漂移模拟夹具（issue #8 的验收用）
+
+这个文件**不属于内核**，它是上游同步通道的**测试夹具**。
+
+sync-drift-sim 分支 = 上游 lineage-23.2 的 HEAD（71b13e62）+ **这一个提交**。
+于是「本线 ksu-lineage-23.2 ↔ 该分支」这一对**真的构成一次漂移**：
+merge-base 恰是 71b13e62（与真实上游一致），而该分支领先我们 1 个提交。
+
+为什么需要它：上游 lineage-23.2 自 2026-07-13 起没动过，
+「检测到漂移 → 试合并 → 触发构建」这条路径在真实上游上**等不到**一次触发，
+而它恰恰是这条通道的主干。做法见 docs/los-line/tickets.md 的 issue #8 一节。
+
+用法：手动派发检测器时把上游指过来 ——
+gh workflow run detect.yml -f upstream_repo=Bonger34/android_kernel_xiaomi_sm8250 -f upstream_ref=sync-drift-sim
+
+⚠️ 派发检测器时**必须显式指定这两个入参**，默认值指向真实上游（LineageOS/...@lineage-23.2）。
