@@ -26,6 +26,10 @@ on:
         description: "底包期次 YYYY-MM-DD（留空 = 现拉官方最新一期，见规格实现决定 4）"
         required: false
         default: ""
+      upstream_sha:
+        description: "本批次对应的上游提交（规格 §5 来源说明四项之一；留空 = 未记录，手动触发就是这样）"
+        required: false
+        default: ""
 
 jobs:
   build:
@@ -242,6 +246,7 @@ jobs:
             --repo "${{ github.repository }}" \
             --branch "${{ github.ref_name }}" \
             --commit "${{ github.sha }}" \
+            --upstream-sha "${{ inputs.upstream_sha }}" \
             --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --fetch-log base-fetch.log
 
@@ -275,7 +280,9 @@ jobs:
           if-no-files-found: error
 
       # ⚠️ `if: always()` 是**故意的**：闸门不过时 job 会失败，但产物仍要留下来供事后诊断
-      #    （规格用户故事 11）。而闸门不过就不会有 PROVENANCE.md —— 那正是可读的信号。
+      #    （规格用户故事 11）。⚠️ 注意此时 dist 里**可能已经有一份 PROVENANCE.md** ——
+      #    它写在**预检之后、终检之前**，所以它记的是「预检通过」而不是整条链的结论。
+      #    这正是那份文件第五节明说「最终结论看 CI run 的状态」的原因。
       - uses: actions/upload-artifact@v4
         if: always()
         with:

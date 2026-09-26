@@ -21,8 +21,16 @@
 用法:
   python .github/scripts/package.py --image <Image> --config <.config> --system-map <System.map> \\
       --base <底包.img> --template <AK3 模板.tar.gz> --out-dir <产物目录> \\
-      [--template-sha256 SHA] [--repo R] [--branch B] [--commit SHA] [--run-url URL] \\
-      [--fetch-log <fetch-base.py 的输出>] [--line-name LOS23.2] [--ksu-version 0.9.5] [--device umi]
+      [--template-sha256 SHA] [--repo R] [--branch B] [--commit SHA] [--upstream-sha SHA] \\
+      [--run-url URL] [--fetch-log <fetch-base.py 的输出>] \\
+      [--line-name LOS23.2] [--ksu-version 0.9.5] [--device umi]
+
+退出码: 本脚本**没有自己的退出码** —— 它返回**失败那一步的**退出码（原样透传），
+        好让调用方从码值仍能定位是哪一类问题（用法错误 / 输入不合法 / 判据不过）。
+        每一步的语义见那个工具自己的文件头：
+          `repack-boot.py` 2=用法 3=输入不合法 ｜ `make-ak3.py` 1=自检不过
+          `verify-release.py` 1=判据不过 2=用法 ｜ `make-provenance.py` 1=结论不一致 2=用法
+        本脚本自己只返回 1（输入件不齐 / 模板钉值不符 / 推不出版本串）。
 """
 import argparse
 import hashlib
@@ -44,14 +52,35 @@ SUMS = "SHA256SUMS.txt"
 
 def load_vf():
     """`verify-fields.py` 是「从 Image 取版本串」的唯一实现 —— 不在这里重写一份。"""
-    for p in (os.path.join(os.path.dirname(SD), "tools", "verify-fields.py"),
-              os.path.join(SD, "verify-fields.py")):
+    cands = [os.path.join(os.path.dirname(SD), "tools", "verify-fields.py"),
+             os.path.join(SD, "verify-fields.py")]
+    for p in cands:
         if os.path.exists(p):
             spec = importlib.util.spec_from_file_location("vf", p)
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             return mod
-    raise SystemExit("找不到 verify-fields.py，试过 %s 与 %s" % (SD, os.path.dirname(SD)))
+    # 报**实际试过的路径**，不是目录 —— 否则读日志的人还得自己拼一遍
+    raise SystemExit("找不到 verify-fields.py，试过：\n  " + "\n  ".join(cands))
+
+
+def cfg_map(path):
+    """读 `.config`。
+
+    ⚠️ 与 `verify-release.py` 的 `_cfg_map` **同款**：显式关掉的项（`# CONFIG_X is not set`）
+    要记成 `"n"`，**不能**当成「不存在」—— 「有意关掉」与「这棵树没有这一项」在排查时是
+    两种结论。这里判档位只看 `== "y"`，两种写法都不影响**判定**；差别在日志里那句话
+    会不会把 `n` 说成「（未设）」，从而误导下一个读日志的人。
+    """
+    out = {}
+    for line in open(path, encoding="utf-8", errors="replace"):
+        s = line.strip()
+        if s.startswith("CONFIG_") and "=" in s:
+            k, v = s.split("=", 1)
+            out[k] = v
+        elif s.startswith("# CONFIG_") and s.endswith(" is not set"):
+            out[s[2:-11].strip()] = "n"
+    return out
 
 
 def sha256_file(p):
@@ -60,16 +89,6 @@ def sha256_file(p):
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
-
-
-def cfg_map(path):
-    out = {}
-    for line in open(path, encoding="utf-8", errors="replace"):
-        s = line.strip()
-        if s.startswith("CONFIG_") and "=" in s:
-            k, v = s.split("=", 1)
-            out[k] = v
-    return out
 
 
 def run(step, argv):
@@ -97,10 +116,15 @@ def write_sums(d):
 
 
 def fresh_dir(d):
-    """清空重建产物目录。⚠️ 加保护：绝不对根目录/当前目录下手。"""
+    """清空重建产物目录。⚠️ 三重保护：绝不对根目录、当前目录、**当前目录的祖先**下手。"""
     ap = os.path.abspath(d)
-    if ap in (os.path.abspath(os.sep), os.getcwd()) or os.path.dirname(ap) == ap:
+    cwd = os.getcwd()
+    if ap in (os.path.abspath(os.sep), cwd) or os.path.dirname(ap) == ap:
         raise SystemExit("拒绝清空 %s —— 它太靠近根目录了" % ap)
+    # ⚠️ 第三种情形最阴：在子目录里跑、把 `--out-dir` 给成工作区根（或它的任何祖先），
+    #    `rmtree` 会把**当前所在的整棵树**删掉，而前两条检查都拦不住。
+    if cwd.startswith(ap + os.sep):
+        raise SystemExit("拒绝清空 %s —— 它是当前目录（%s）的祖先" % (ap, cwd))
     shutil.rmtree(ap, ignore_errors=True)
     os.makedirs(ap)
     return ap
@@ -118,6 +142,9 @@ def main(argv):
     ap.add_argument("--repo", default="Bonger34/android_kernel_xiaomi_sm8250")
     ap.add_argument("--branch", default="ksu-lineage-23.2")
     ap.add_argument("--commit", default="（未记录）")
+    ap.add_argument("--upstream-sha", default="",
+                    help="本批次**对应的上游提交**（规格 §5 的来源说明四项之一；"
+                         "#8 起由检测器传入，手动触发时为空 —— 那时来源说明如实写「未记录」）")
     ap.add_argument("--run-url", default="")
     ap.add_argument("--fetch-log", default=None)
     ap.add_argument("--line-name", default="LOS23.2", help="命名里的线名")
@@ -169,7 +196,13 @@ def main(argv):
     vm = vf.get_vermagic(open(a.image, "rb").read()) or ""
     krelease = vm.split(" ")[0].replace("-dirty", "")   # `-dirty` 是工作树标记，不是版本
     if not krelease:
-        print("❌ 从 Image 里取不到 vermagic ⇒ 推不出内核版本串，命名无从谈起")
+        print("❌ 从 Image 里取不到 vermagic —— 推不出内核版本串，而产物命名要它：")
+        print("   期望 %s" % "形如 `4.19.325-…-perf-g<hash> SMP preempt …` 的串（≥12 个可见字符）")
+        print("   实际 %s（%d 字节，sha256 %s）"
+              % (a.image, os.path.getsize(a.image), sha256_file(a.image)[:16]))
+        print("   ⇒ 最可能的原因：① 传进来的不是内核 Image（比如把 boot.img 传了进来）；")
+        print("     ② 该树没开 CONFIG_PREEMPT —— 那 vermagic 里就没有 ` SMP preempt `；")
+        print("     ③ 文件被截断（大文件会静默截断，见 PROJECT.md §7 坑表 #21）。")
         return 1
     print("\n档位 %s ｜ 内核版本串 %s" % (profile, krelease))
     print("  CONFIG_CFI_CLANG=%s ⇒ 命名后缀 %r" % (cm.get("CONFIG_CFI_CLANG", "（未设）"), tag))
@@ -198,7 +231,12 @@ def main(argv):
     rc = run("打 AnyKernel3 卡刷包",
              [py, os.path.join(SD, "make-ak3.py"), "--kernel", a.image,
               "--template", a.template, "--out", os.path.join(d, names["zip"]),
-              "--device", a.device])
+              "--device", a.device,
+              # ⚠️ 把 KSU 版本**显式传进去**：`make-ak3.py` 的默认串里也写着一个 v0.9.5，
+              #    不传的话「文件名说 0.9.6、zip 里的 anykernel.sh 说 0.9.5」迟早发生 ——
+              #    正是本文件上面那段注释（命名/档位/实际配置三者必须同源）要防的事。
+              #    （默认值一致时它**不改字节**：拼出来与 make-ak3.py 的默认串逐字相同。）
+              "--kernel-string", "KernelSU v%s for LineageOS by Bonger34" % a.ksu_version])
     if rc:
         return rc
 
@@ -213,12 +251,17 @@ def main(argv):
         return rc
 
     # ── 五、元数据：来源说明 → 重生成清单（多出 PROVENANCE.md 那一条）→ 终检 ──
-    rc = run("写来源说明（闸门结论写进 PROVENANCE.md）",
+    rc = run("写来源说明（预检结论写进 PROVENANCE.md；终检在它之后跑）",
              [py, os.path.join(SD, "make-provenance.py"), "--dir", d, "--base", a.base,
               "--repo", a.repo, "--branch", a.branch, "--commit", a.commit,
               "--run-url", a.run_url,
-              "--gate", "✅ 通过（`verify-release.py --line los --profile %s`，退出码 0；"
-                        "第六项「两次构建逐字节比对」本次跳过，见第四节）" % profile]
+              "--upstream-sha", a.upstream_sha,
+              # ⚠️ 措辞必须说清这是**哪一遍**闸门的结论：本文件写在预检之后、终检**之前**，
+              #    而终检失败时它已经落盘、还会随失败产物一起被上传（`if: always()`）。
+              #    写成「闸门通过」就会让一份失败的 artifact 自称通过。
+              "--gate", "✅ **预检**通过（`verify-release.py --line los --profile %s`，退出码 0）。"
+                        "本文件写于预检之后、**终检之前** —— 整条链的最终结论看 CI run 的状态。"
+                        "第六项「两次构建逐字节比对」本次跳过，见第四节。" % profile]
              + (["--fetch-log", a.fetch_log] if a.fetch_log else []))
     if rc:
         return rc

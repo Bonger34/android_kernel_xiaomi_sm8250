@@ -13,10 +13,11 @@
 用法:
   python tools/make-provenance.py --dir <产物目录> --base <底包.img>
         [--fetch-log <fetch-base.py 的输出>] [--repo R] [--branch B] [--commit SHA]
-        [--run-url URL] [--gate 文本] [--repro 文本] [--out 路径] [--self-test]
+        [--upstream-sha SHA] [--run-url URL] [--gate 文本] [--repro 文本]
+        [--out 路径] [--self-test]
 
-退出码: 0 = 成功；1 = 输入不合法或**结论不一致**（例如官方公布的 sha256 与实际下载件不符）；
-        2 = 用法错误
+退出码: 0 = 成功；1 = 输入不合法或**结论不一致**（例如官方公布的 sha256 与实际下载件不符、
+        或壳/zip 里的内核与 Image 不同源）；2 = 用法错误
 """
 import argparse
 import hashlib
@@ -123,7 +124,12 @@ def render(ctx):
     A("|---|---|")
     A("| 仓库 | %s |" % ctx["repo"])
     A("| 分支 | %s |" % ctx["branch"])
-    A("| 构建提交 | `%s` |" % ctx["commit"])
+    A("| 构建提交（本线分支 HEAD） | `%s` |" % ctx["commit"])
+    if ctx["upstream_sha"]:
+        A("| **对应的上游提交** | `%s` |" % ctx["upstream_sha"])
+    else:
+        A("| **对应的上游提交** | （未记录 —— 本批次是 `workflow_dispatch` 手动触发的，"
+          "没有合并上游；#8 起由检测器传入） |")
     if ctx["run_url"]:
         A("| CI run | %s |" % ctx["run_url"])
     A("")
@@ -177,9 +183,13 @@ def render(ctx):
     A("")
     A("%s" % ctx["gate"])
     A("")
-    A("判据入口只有一个：`verify-release.py --line los`（规格的接缝 S1）。")
-    A("⚠️ 本文件写在**闸门通过之后** —— 所以能读到本文件，就等于那次闸门是过的；")
-    A("闸门不过时 workflow 直接失败，不会写出本文件。")
+    A("判据入口只有一个：`verify-release.py --line los`（规格的接缝 S1），封装链跑**两遍**。")
+    A("")
+    A("⚠️ **上面那段是「预检」那一遍的结论。** 本文件写在预检之后、**终检之前** ——")
+    A("终检（连本文件与终版 `SHA256SUMS.txt` 一起核）在封装链最后跑。")
+    A("⇒ 「读得到本文件」只证明**预检**是过的；**终检的结论要看 CI run 的状态**。")
+    A("⚠️ 终检不过时 run 会失败，但**本文件已经落盘**，仍会随失败产物一起留下来供诊断 ——")
+    A("那正是「失败产物照样留存」要的，只是别把这里那个 ✅ 当成整条链的最终结论。")
     A("")
     A("## 六、这批产物**不是**什么")
     A("")
@@ -198,6 +208,8 @@ def main(argv):
     ap.add_argument("--repo", default="Bonger34/android_kernel_xiaomi_sm8250")
     ap.add_argument("--branch", default="ksu-lineage-23.2")
     ap.add_argument("--commit", default="（未记录）")
+    ap.add_argument("--upstream-sha", default="",
+                    help="本批次**对应的上游提交**（#8 起由检测器传入；手动触发时通常为空）")
     ap.add_argument("--run-url", default="")
     ap.add_argument("--gate", default="（未记录）")
     ap.add_argument("--repro", default="未做 —— 两次构建逐字节比对由 issue #6 负责。")
@@ -225,14 +237,13 @@ def main(argv):
 
     # ★ 这就是 issue #5 的验收之一：「来源说明里的底包 sha256 与实际下载到的那份一致」。
     #   官方公布了值、而实际字节不符 ⇒ 当场失败，绝不写一份自相矛盾的说明。
+    #   （字节数也一并报出来 —— 长度不符必然让 sha256 也不符，所以上面这一条就够，
+    #    不必再单列一条「字节数不符」的判定：那条永远走不到，是个好看的死代码。）
     if fetch and fetch["sha256"] != base["sha256"]:
         print("❌ 底包与实际下载件不符：")
         print("   官方公布 %s（%d 字节）" % (fetch["sha256"], fetch["size"]))
         print("   实际文件 %s（%d 字节）" % (base["sha256"], base["size"]))
         print("   ⇒ 最可能的原因：下载被截断/被换掉，或官方那一期被重新发布过。")
-        return 1
-    if fetch and fetch["size"] != base["size"]:
-        print("❌ 底包字节数不符：官方 %d，实际 %d" % (fetch["size"], base["size"]))
         return 1
 
     files = scan(a.dir)
@@ -241,31 +252,37 @@ def main(argv):
         return 1
 
     names = [n for n, _s, _h in files]
-    img = pick(names, lambda n: n == "Image" or n.startswith("Image-"))
-    boot = pick(names, lambda n: n.startswith("boot-") and n.endswith(".img"))
+    imgs = [n for n in names if n == "Image" or n.startswith("Image-")]
+    boots = [n for n in names if n.startswith("boot-") and n.endswith(".img")]
     zips = [n for n in names if n.endswith(".zip")]
+    # ⚠️ Image 必须**恰好一个**：同源判据要拿它当基准，多个基准就判不了「三者同源」。
+    #    别学第一版用 `pick()`（命中数 ≠ 1 就返回 None）—— 那样会静默地少核一项还打 ✅。
+    if len(imgs) != 1:
+        print("❌ 目录里应当**恰好一个** Image，实际 %d 个：%s"
+              % (len(imgs), "、".join(imgs) if imgs else "（一个都没有）"))
+        print("   ⇒ 同源判据拿 Image 当基准；基准不唯一，就没法回答「三者是不是同一个内核」。")
+        return 1
+    img = imgs[0]
 
     vf = load_vf()
     same_source = []
-    if boot:
-        same_source.append(("`%s` 内嵌的 kernel 段" % boot,
-                            hashlib.sha256(vf.load_kernel(os.path.join(a.dir, boot))).hexdigest()))
+    for b in boots:                      # **全部** boot-*.img 都要查，不是只查第一个
+        same_source.append(("`%s` 内嵌的 kernel 段" % b,
+                            hashlib.sha256(vf.load_kernel(os.path.join(a.dir, b))).hexdigest()))
     for z in zips:
         with zipfile.ZipFile(os.path.join(a.dir, z)) as zf:
             got = hashlib.sha256(zf.read("Image")).hexdigest() if "Image" in zf.namelist() else None
         same_source.append(("`%s` 里的 `Image`" % z, got))
 
-    img_sha = dict((n, h) for n, _s, h in files).get(img)
+    img_sha = dict((n, h) for n, _s, h in files)[img]
     ctx = {"repo": a.repo, "branch": a.branch, "commit": a.commit, "run_url": a.run_url,
+           "upstream_sha": a.upstream_sha,
            "fetch": fetch, "base": base, "files": files,
            "image_sha": img_sha, "same_source": same_source,
            "gate": a.gate, "repro": a.repro}
 
     # ★ 同源关系的**硬判据**放在落盘之前：不合格就立刻失败，**不写文件**。
     #   否则目录里会留下一份「写着自己不合格」的来源说明，下游只会读到它、不会读到退出码。
-    if img is None:
-        print("❌ 目录里没有 Image —— 三代同源无从谈起")
-        return 1
     bad = [lbl for lbl, sha in same_source if sha != img_sha]
     if bad:
         print("❌ 与 Image 不同源：")
@@ -279,7 +296,8 @@ def main(argv):
         f.write(render(ctx))
     print("已写 %s（%d 字节）" % (out, os.path.getsize(out)))
     print("  目录内 %d 个文件（不含本文件）｜ 底包 sha256 %s" % (len(files), base["sha256"][:16]))
-    print("  ✅ 同源：%s" % ("、".join(lbl for lbl, _s in same_source) or "（目录里没有壳/zip）"))
+    print("  ✅ 同源：%s" % ("、".join(lbl for lbl, _s in same_source) or
+                             "（目录里没有壳/zip —— 这一项**本次没有核**）"))
     return 0
 
 
@@ -323,8 +341,8 @@ def self_test():
         _touch(base, b"B" * 4096)          # 底包内容随意 —— 本工具的用例不解析它
         d = os.path.join(tmp, "dist")
         os.makedirs(d)
-        ki = _touch(os.path.join(d, "Image-micode-4.19.325-perf-g0000000000-LOS23.2-ksu-0.9.5"), kernel)
-        _touch(os.path.join(d, "config-micode-4.19.325-perf-g0000000000-LOS23.2"), b"CONFIG_KSU=y\n")
+        ki = _touch(os.path.join(d, "Image-4.19.325-cip131-st15-perf-g0000000000-LOS23.2-ksu-0.9.5"), kernel)
+        _touch(os.path.join(d, "config-4.19.325-cip131-st15-perf-g0000000000-LOS23.2"), b"CONFIG_KSU=y\n")
         _touch(os.path.join(d, "System.map"), b"ffffffff81000000 T _text\n")
         _touch(os.path.join(d, "boot-LOS23.2-ksu-0.9.5-umi.img"), _bootimg(kernel))
         _zip_with_image(os.path.join(d, "AnyKernel3-LOS23.2-ksu-0.9.5-umi.zip"), kernel)
@@ -421,15 +439,41 @@ def self_test():
 
     case("负向：产物目录是空的 ⇒ 失败", c6)
 
+    # ⑦ 两个 `boot-*.img`（一个同源、一个不同源）⇒ 必须失败。
+    #    ⚠️ 第一版用「命中数 ≠ 1 就返回 None」挑壳 ⇒ 有第二个壳时**整条同源检查会消失**，
+    #    输出照样带 ✅ —— 而这一节的标题正是「三者必须是同一个内核」。
+    def c7(tmp):
+        base, d, _ki = _setup(tmp)
+        _touch(os.path.join(d, "boot-second.img"), _bootimg(b"X" * 5000))
+        rc, txt = run(base, d)
+        assert rc == 1, "有第二个（不同源的）boot.img 时应当失败，得到 %r" % (rc,)
+        assert txt == "", "不合格时不该留下来源说明"
+        return "1，两个壳里的内核都查了（不再只看第一个）"
+
+    case("负向：两个 boot.img，第二个不同源 ⇒ 失败", c7)
+
+    # ⑧ 两个 `Image` ⇒ 必须失败：同源判据拿 Image 当基准，基准不唯一就没法判。
+    def c8(tmp):
+        base, d, _ki = _setup(tmp)
+        _touch(os.path.join(d, "Image-second"), b"K" * 5000)
+        rc, txt = run(base, d)
+        assert rc == 1, "两个 Image 时应当失败，得到 %r" % (rc,)
+        assert txt == "", "基准不唯一时不该留下来源说明"
+        return "1，明说「应当恰好一个 Image」"
+
+    case("负向：两个 Image ⇒ 失败", c8)
+
     fails = 0
     for name, fn in cases:
         tmp = tempfile.mkdtemp(prefix="prov-")
         try:
             note = fn(tmp)
             print("  ✅ %-44s %s" % (name, note))
-        except AssertionError as e:
+        except Exception as e:
+            # ⚠️ 捕 `Exception` 而不是 `AssertionError`：用例里**抛别的异常**（夹具退化、
+            #    zipfile 报错…）本身就是「这条不合格」，不该让它中断整轮、连计数都不给。
             fails += 1
-            print("  ❌ %-44s %s" % (name, e))
+            print("  ❌ %-44s %s: %s" % (name, type(e).__name__, e))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
     print("\n%d/%d 通过" % (len(cases) - fails, len(cases)))

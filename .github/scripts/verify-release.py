@@ -147,6 +147,14 @@ def main(argv):
     if not os.path.isdir(d):
         print("不是目录: %s" % d)
         return 2
+    # ⚠️ 加了存在性检查：`matrix` 默认是 `<WS>/docs/matrix2.tsv`，而**官方线 profile 才有**这个输入。
+    #    本文件现在也会被镜像到 CI 的 `.github/scripts/` 下跑，那时 `WS` = `<仓库>/.github`，
+    #    其下没有 `docs/` ⇒ 任何**不带 `--line los`** 的 CI 调用都会以 FileNotFoundError
+    #    traceback 收场（而不是像上面那样打印用法并返回 2）。
+    if not os.path.exists(matrix):
+        print("参数表不存在: %s" % matrix)
+        print("  ⇒ 只有**官方线** profile 需要它；LOS 线请用 `--line los`（它不读 --matrix）。")
+        return 2
     mname = os.path.basename(matrix)
 
     # 版本 → 原厂基准
@@ -337,13 +345,25 @@ def _cfg_map(path):
     return out
 
 
-def _verdict(fails):
+def _verdict(fails, skipped=()):
+    """结论行。
+
+    ⚠️ `skipped` **必须报出来**：如果「有东西没核」与「核过了」打印同一句 `✅ 全部通过`，
+    那份「全绿」就是假的 —— 这正是本项目反复踩的那类陷阱（PROJECT.md §7 坑表 #32、
+    `verify-manifest.py` 无参数只查一份那次事故）。跳过的项**不算失败**（部分体检是合法用法），
+    但它必须出现在结论里。
+    """
     print("\n" + "=" * 60)
     if fails:
         print("❌ 不通过（%d 项）：" % len(fails))
         for x in fails:
             print("   - " + x)
         return 1
+    if skipped:
+        print("✅ 通过 —— ⚠️ 但本次**跳过**了 %d 项，它们**没被核**（不等于通过）：" % len(skipped))
+        for x in skipped:
+            print("   - " + x)
+        return 0
     print("✅ 全部通过")
     return 0
 
@@ -353,6 +373,7 @@ def los_main(d, repro, profile="main", lto_expect="y"):
           % (profile, lto_expect))
     print("资产目录: %s\n" % d)
     fails = []
+    skipped = []          # 没核的项 —— 它们要进结论行，见 _verdict 的注释
     must_y = list(LOS_MUST_BE_Y)
     must_n = []
     if profile == "cfi-experiment":
@@ -380,7 +401,10 @@ def los_main(d, repro, profile="main", lto_expect="y"):
                                   os.path.relpath(p, d) if p else ""))
     if not (img and cfg and smap):
         print("\n三件套不齐，后续检查无法进行。")
-        return _verdict(fails)
+        skipped += ["第四项：各产物与配套 Image 同源（三件套不齐，没跑到）",
+                    "第五项：`SHA256SUMS.txt` 覆盖全部资产（三件套不齐，没跑到）",
+                    "第六项：两次构建逐字节相同（三件套不齐，没跑到）"]
+        return _verdict(fails, skipped)
 
     print("\n=== 二、.config 关键项 ===")
     cm = _cfg_map(cfg)
@@ -417,6 +441,7 @@ def los_main(d, repro, profile="main", lto_expect="y"):
     want = sha256_file(img)
     if not boots:
         print("  boot.img：（本目录无，跳过）")
+        skipped.append("第四项：`boot-*.img` 内嵌内核与配套 Image 同源（本目录无 boot.img）")
     else:
         for p in boots:
             got = hashlib.sha256(vf.load_kernel(p)).hexdigest()
@@ -432,6 +457,7 @@ def los_main(d, repro, profile="main", lto_expect="y"):
                 zips.append(os.path.join(dirpath, f))
     if not zips:
         print("  AnyKernel3：（本目录无 .zip，跳过）")
+        skipped.append("第四项：AK3 zip 里的 `Image` 与配套 Image 同源（本目录无 .zip）")
     else:
         # AK3 zip 里也有一份 Image —— 必须与发布的那份同源，否则「boot.img 是一个版本、
         # zip 是另一个版本」。这与第三项的 boot.img 检查是同一个道理。
@@ -451,6 +477,7 @@ def los_main(d, repro, profile="main", lto_expect="y"):
     sums = _find(d, {"SHA256SUMS.txt"})
     if not sums:
         print("  （不存在，跳过）")
+        skipped.append("第五项：`SHA256SUMS.txt` 覆盖全部资产（本目录无清单）")
     else:
         base = os.path.dirname(sums)
         listed = {}
@@ -484,6 +511,7 @@ def los_main(d, repro, profile="main", lto_expect="y"):
     print("\n=== 六、可复现（同配方两次构建逐字节相同）===")
     if not repro:
         print("  （未提供 --repro <第二个目录>，跳过）")
+        skipped.append("第六项：两次构建逐字节相同（未提供 `--repro`）")
     else:
         for label, p, ex, pf in (("Image", img, {"Image"}, ("Image-",)),
                                  (".config", cfg, {".config"}, ("config-",)),
@@ -499,7 +527,7 @@ def los_main(d, repro, profile="main", lto_expect="y"):
                 fails.append("%s 两次构建不同" % label)
             print("  %-12s %s  %s" % (label, "✅" if h1 == h2 else "❌", h1[:32]))
 
-    return _verdict(fails)
+    return _verdict(fails, skipped)
 
 
 if __name__ == "__main__":
