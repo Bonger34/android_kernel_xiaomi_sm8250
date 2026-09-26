@@ -151,3 +151,21 @@ jobs:
           echo "merge_base = ${{ steps.detect.outputs.merge_base }}"
           echo "心跳       = 到期 ${{ steps.detect.outputs.heartbeat_due }} / 已写 ${{ steps.detect.outputs.heartbeat_written }}"
           echo "（本工单到此为止：无漂移、有漂移都不构建 —— 那是 #8）"
+
+      # ⚠️ **运行摘要**是这条通道唯一被人读的东西（一天一次，没人会去翻日志），
+      #    而它「写没写成功」在界面上**看不出来**：摘要为空时那次运行照样是绿的。
+      #    ⇒ 把「非空」做成一道检查，并把内容打进日志 —— 于是它可核验、也留得下证据
+      #    （`$GITHUB_STEP_SUMMARY` 是**每个 job 一个**的文件，前面的步骤往里追加，
+      #      这里读到的是累积后的全文）。
+      - name: "检查运行摘要非空（人打开这次运行就看它）"
+        run: |
+          set -euo pipefail
+          if [ ! -s "$GITHUB_STEP_SUMMARY" ]; then
+            echo "❌ \$GITHUB_STEP_SUMMARY 是空的 —— 摘要没写成功，而运行照样是绿的"
+            echo "   （detect.py 的 --summary 参数写的就是这个文件）"
+            exit 1
+          fi
+          echo "运行摘要 $(wc -c < "$GITHUB_STEP_SUMMARY") 字节，逐字如下："
+          echo "┌─────────────────────────────────────────────"
+          cat "$GITHUB_STEP_SUMMARY"
+          echo "└─────────────────────────────────────────────"
