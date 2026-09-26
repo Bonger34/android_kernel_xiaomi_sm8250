@@ -22,6 +22,10 @@ on:
         description: "环境哨兵负向自测：故意换掉已知输入，哨兵必须失败、构建必须中止（true/false）"
         required: false
         default: "false"
+      base_date:
+        description: "底包期次 YYYY-MM-DD（留空 = 现拉官方最新一期，见规格实现决定 4）"
+        required: false
+        default: ""
 
 jobs:
   build:
@@ -34,6 +38,13 @@ jobs:
       TZ: UTC
       KBUILD_BUILD_USER: bonger
       KBUILD_BUILD_HOST: github-actions
+      # ── 封装链用到的 AK3 模板钉值（issue #5）────────────────────────────
+      # ⚠️ 上游 `osm0sis/AnyKernel3@master` 是**会动**的：它变了，zip 的字节就会变
+      #    （anykernel.sh 的内容与 tools/magiskboot 都会进 zip）。钉住 ⇒ 上游一改版
+      #    **当场失败**，而不是悄悄产出一批用别的模板做的 zip。
+      #    要接受新模板就改这一行 —— 那是**人的决定**，不该由构建代劳。
+      AK3_TEMPLATE_URL: https://codeload.github.com/osm0sis/AnyKernel3/tar.gz/refs/heads/master
+      AK3_TEMPLATE_SHA256: a74f8acd2a0855460e16c31a79db344b22c22f082432d946d2db3c727f59a921
     steps:
       - uses: actions/checkout@v4
         with:
@@ -192,6 +203,65 @@ jobs:
           make O=out ARCH=arm64 LLVM=1 -j"$(nproc)" Image
           ls -lh out/arch/arm64/boot/Image
 
+      # ══════════════════════════════════════════════════════════════════
+      #  封装链（issue #5）：编译 → 重打包 → AK3 → 清单 → 闸门 → 来源说明
+      #  ⚠️ 这一段的**编排逻辑**在 `.github/scripts/package.py` 里，不在这里。
+      #     为什么：本机没有可用的 bash，写在 YAML 里的步骤只能上 CI 试（一轮 20 分钟）；
+      #     写成 Python 脚本，同一条链在本机就能跑通 —— 而且本机有已发布批次的输入件，
+      #     「重打包出来的 boot.img 与已发布的逐字节相同」是个**强判据**。
+      #     workflow 只负责：取底包 → 调它 → 传 artifact。
+      # ══════════════════════════════════════════════════════════════════
+
+      # 底包每次都**现拉**（规格实现决定 4）：官方直接单独发布 `boot.img`，不必解 ROM 包。
+      # 输出 tee 进日志 —— 来源说明要记期次与来源 URL，那份日志就是它的输入之一。
+      - name: "Fetch LineageOS base boot.img (input of the whole chain)"
+        env:
+          BASE_DATE: ${{ inputs.base_date }}
+        run: |
+          set -euo pipefail
+          ARGS="--latest"
+          if [ -n "$BASE_DATE" ]; then
+            ARGS="--date $BASE_DATE"
+            echo "  ⚠️ 期次被 input 钉住：$BASE_DATE（默认是现拉最新）"
+          fi
+          python3 .github/scripts/fetch-base.py $ARGS --out base.img | tee base-fetch.log
+          echo "  复算件 base.img sha256 = $(sha256sum base.img | cut -d' ' -f1)"
+
+      - name: "Package: repack boot.img + AnyKernel3 + manifest + gate + provenance"
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o ak3-template.tar.gz "$AK3_TEMPLATE_URL"
+          python3 .github/scripts/package.py \
+            --image out/arch/arm64/boot/Image \
+            --config out/.config \
+            --system-map out/System.map \
+            --base base.img \
+            --template ak3-template.tar.gz \
+            --template-sha256 "$AK3_TEMPLATE_SHA256" \
+            --out-dir dist \
+            --repo "${{ github.repository }}" \
+            --branch "${{ github.ref_name }}" \
+            --commit "${{ github.sha }}" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --fetch-log base-fetch.log
+
+      # 独立复算：**用另一个工具**（sha256sum，不是 python）再算一遍底包，
+      # 与来源说明里记的那一行逐字比对。哨兵的「复算件」是这个路子，这里照做 ——
+      # 两条独立路径给出同一个值，才算「来源说明里的底包 sha256 与实际那份一致」。
+      - name: "Recount: provenance's base sha256 must equal the actual file"
+        run: |
+          set -euo pipefail
+          GOT="$(sha256sum base.img | cut -d' ' -f1)"
+          echo "  实际下载件 sha256 = $GOT"
+          if ! grep -qF "| sha256 | \`$GOT\` |" dist/PROVENANCE.md; then
+            echo "❌ 来源说明里的底包 sha256 与实际下载件不符。"
+            echo "   实际 $GOT"
+            echo "   说明里那一节："
+            sed -n '/## 二、底包/,/^$/p' dist/PROVENANCE.md
+            exit 1
+          fi
+          echo "  ✅ 与 PROVENANCE.md 记的那一行逐字相同"
+
       - uses: actions/upload-artifact@v4
         with:
           name: kernel-image
@@ -203,3 +273,13 @@ jobs:
           #    而且**不报错**。本项目实测：下载回来的 artifact 里只有 Image，没有 .config。
           include-hidden-files: true
           if-no-files-found: error
+
+      # ⚠️ `if: always()` 是**故意的**：闸门不过时 job 会失败，但产物仍要留下来供事后诊断
+      #    （规格用户故事 11）。而闸门不过就不会有 PROVENANCE.md —— 那正是可读的信号。
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: los23.2-umi-${{ github.sha }}
+          path: dist/
+          include-hidden-files: true
+          if-no-files-found: warn
