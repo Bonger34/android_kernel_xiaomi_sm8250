@@ -45,10 +45,19 @@
 ⚠️ **只对「同一个上游提交」拉黑**（规格原文：「同一个上游提交失败后不再重试」）。
 `failed.upstream` 与 `--upstream` 不同 ⇒ 这个标记与本次无关，**不算拉黑**。
 
-⚠️ **标记文件损坏时的行为：按「无标记」处理，并在 stderr 说清是哪一种损坏。**
+⚠️ **标记写坏时的行为：按「无标记」处理，并说清是哪一种坏。**
 理由：一个读不出来的状态文件不能让整条通道停摆 —— 最坏后果只是多试一次已被拉黑的提交
 （构建失败 + 开 issue 都有幂等去重），而没有这个兜底，损坏的文件会**永久卡死每一次检测**。
-判据仍留在 stdout（`marker: 损坏→按无标记处理`），所以它不会被误读成「一切正常」。
+
+⚠️ **但「按无标记处理」这条只对结论真正依赖的那一半成立**（这一条是 code-review 抓出来的，
+第一版就是反的）：两个字段的权重不同 —— **`failed` 决定拉黑，`heartbeat` 只决定该不该写心跳**。
+
+| 坏在哪 | 判定 | 为什么 |
+|---|---|---|
+| `failed` 坏（或整个文件读不出来/不是 JSON） | `损坏` ⇒ **不拉黑**，按无标记继续 | 拿不出可信的「这个提交已试过」，就不该阻止重试 |
+| 只有 `heartbeat` 坏、`failed` 完好 | **`有效`** ⇒ 拉黑照旧生效，心跳按「从未记录」算 | 拉黑完全由 `failed` 决定；若在这里改判「按无标记」，输出就会**说一套做一套**（说会重试、退出码却是 20）—— 那比坏掉本身更坏，它让日志说谎 |
+
+⇒ 不变量：**只要输出里打印了「按无标记处理」，结论就不可能是 `blacklisted`**。自测里有专门断言。
 
 ## 四选一的结论与退出码
 
@@ -86,8 +95,14 @@ python tools/sync-check.py --self-test          # 离线表驱动，覆盖验收
 
 选项：`--marker <文件>` `--today <YYYY-MM-DD>` `--expire-days <n>` `--heartbeat-days <n>`
       `--upstream-subject <文本>`（只进输出，给 issue 标题用）`--json`
+      `--self-test`（跑内置用例）`--self-test-dir <目录>`（自测落临时文件的位置）
 
 退出码：0 / 10 / 20 / 30 = 上表四种结论；2 = 用法错误（缺必填参数等）。
+
+⚠️ **本文件有**两份，必须逐字节相同**：工作区的 `tools/sync-check.py`，与 LOS 工作仓库里的
+`.github/scripts/sync-check.py`（CI 跑**后者** —— 内核树自带一个 `tools/`，那是上游的，
+项目自己的 CI 工具一律放 `.github/`，同 `repack-boot.py`）。
+镜像与复验：`python tools/sync-ci-scripts.py --gen` / `--check`（改一份就同步改另一份）。
 """
 
 import argparse
@@ -95,6 +110,7 @@ import datetime
 import json
 import os
 import sys
+from typing import NamedTuple
 
 # ── 两个天数都是**规格里的决定**，不是随手取的常数（见文件头表格）─────────────
 EXPIRE_DAYS = 7
@@ -122,11 +138,13 @@ def parse_date(text, what):
 
 
 def _one_state(doc, today, expire_days):
-    """解析状态文件里的**两个字段**，返回 `(state, 错误列表)`。
+    """解析状态文件里的**两个字段**，返回 `(state, 错误列表)`。错误项形如 `("failed", 说明)`。
 
     ⚠️ 两个字段**各自独立解析**：`failed` 写坏了不代表 `heartbeat` 也读不出来。
     一个字段坏掉就连另一个的信息一起丢掉，会让「心跳该不该写」这种与失败无关的判断跟着失真
-    （实测抓到的：原先把两个字段串在一起解析，一处损坏就把心跳也抹掉了）。
+    （实测抓到的：原先把两者串在一起解析，一处损坏就把心跳一起抹掉了）。
+    调用方（`load_marker`）再按**是哪一个字段坏了**决定整体判定 —— 因为两个字段的
+    结论权重并不相同（`failed` 决定拉黑，`heartbeat` 只决定「该不该写心跳」）。
     """
     state = dict(failed_sha=None, failed_at=None, failed_age=None, expired=None, heartbeat_at=None)
     errs = []
@@ -134,11 +152,11 @@ def _one_state(doc, today, expire_days):
     failed = doc.get("failed")
     if failed is not None:
         if not isinstance(failed, dict):
-            errs.append("`failed` 不是对象")
+            errs.append(("failed", "`failed` 不是对象"))
         else:
             sha, at = failed.get("upstream"), failed.get("at")
             if not sha or not at:
-                errs.append("`failed` 缺 `upstream` 或 `at`")
+                errs.append(("failed", "`failed` 缺 `upstream` 或 `at`"))
             else:
                 try:
                     fd = parse_date(at, "failed.at")
@@ -146,19 +164,19 @@ def _one_state(doc, today, expire_days):
                     state.update(failed_sha=str(sha).lower(), failed_at=fd, failed_age=age,
                                  expired=age >= expire_days)
                 except ValueError as e:
-                    errs.append(str(e))
+                    errs.append(("failed", str(e)))
 
     hb = doc.get("heartbeat")
     if hb is not None:
         if not isinstance(hb, dict):
-            errs.append("`heartbeat` 不是对象")
+            errs.append(("heartbeat", "`heartbeat` 不是对象"))
         elif not hb.get("at"):
-            errs.append("`heartbeat` 缺 `at`")
+            errs.append(("heartbeat", "`heartbeat` 缺 `at`"))
         else:
             try:
                 state["heartbeat_at"] = parse_date(hb["at"], "heartbeat.at")
             except ValueError as e:
-                errs.append(str(e))
+                errs.append(("heartbeat", str(e)))
     return state, errs
 
 
@@ -192,7 +210,16 @@ def load_marker(path, today, expire_days):
 
     state, errs = _one_state(doc, today, expire_days)
     if errs:
-        return MARKER_BROKEN, state, "%s 里 %s" % (path, "；".join(errs))
+        if state["failed_sha"] is not None:
+            # ⚠️ `heartbeat` 写坏**不影响** `failed` 的判定 —— 两个字段是独立的，而
+            #    「同一个提交已拉黑」这条结论**完全由 failed 决定**。若在这里把整个标记
+            #    判成「损坏 → 按无标记处理」，就会**说一套做一套**：输出说会重试、
+            #    退出码却是 20（今天不做）。那比损坏本身更坏 —— 它让日志说谎。
+            #    代价（心跳时间戳丢了 ⇒ 判成「该写心跳了」，见 check()）是良性的。
+            return MARKER_OK, state, ("`heartbeat` 写坏（%s）⇒ 心跳按「从未记录」算；"
+                                      "`failed` 完好，拉黑判定不受影响"
+                                      % "；".join(m for _f, m in errs))
+        return MARKER_BROKEN, state, "%s 里 %s" % (path, "；".join(m for _f, m in errs))
     if state["failed_sha"] is None and state["heartbeat_at"] is None:
         # 合法 JSON，但两件事都没记 —— 当作「没有标记」，不是损坏
         return MARKER_NO_FAILURE, state, "%s 里既无 failed 也无 heartbeat" % path
@@ -213,9 +240,30 @@ def heartbeat_due(heartbeat_at, today, days):
     return age >= days, age
 
 
+class Outcome(NamedTuple):
+    """`check()` 的返回值。**具名字段**而不是裸 dict —— 它有 14 项，字符串键散在
+    三处（`render` / `main` / 自测）取值，打错一个键要到运行时才发现。
+    仍然是 tuple，所以 `--json` 与解包用法都不受影响（`_asdict()` 直接喂 json）。
+    """
+    state: str
+    exit: int
+    reason: str
+    marker: str
+    marker_note: str
+    blacklisted: bool
+    drift: bool
+    heartbeat_due: bool
+    heartbeat_age_days: int
+    upstream: str
+    local: str
+    merge_base: str
+    failed_sha: str
+    failed_age_days: int
+
+
 def check(upstream, local, merge_base, marker_path, today, expire_days=EXPIRE_DAYS,
           heartbeat_days=HEARTBEAT_DAYS):
-    """纯决策核心。返回一个字典（不打印、不退出），便于表驱动测试与 `--json`。"""
+    """纯决策核心。返回 `Outcome`（不打印、不退出），便于表驱动测试与 `--json`。"""
     upstream = (upstream or "").lower()
     local = (local or "").lower()
     merge_base = (merge_base or "").lower()
@@ -244,37 +292,28 @@ def check(upstream, local, merge_base, marker_path, today, expire_days=EXPIRE_DA
     else:
         ident, reason = ID_IN_SYNC, "merge-base = 上游 HEAD %s ⇒ 已跟上" % upstream[:12]
 
-    return {
-        "state": ident,
-        "exit": EXIT[ident],
-        "reason": reason,
-        "marker": kind,
-        "marker_note": note,
-        "blacklisted": blacklisted,
-        "drift": drift,
-        "heartbeat_due": due,
-        "heartbeat_age_days": hb_age,
-        "upstream": upstream,
-        "local": local,
-        "merge_base": merge_base,
-        "failed_sha": failed_sha,
-        "failed_age_days": state.get("failed_age"),
-    }
+    return Outcome(state=ident, exit=EXIT[ident], reason=reason, marker=kind, marker_note=note,
+                   blacklisted=blacklisted, drift=drift, heartbeat_due=due,
+                   heartbeat_age_days=hb_age, upstream=upstream, local=local,
+                   merge_base=merge_base, failed_sha=failed_sha,
+                   failed_age_days=state.get("failed_age"))
 
 
-def render(r, subject=None):
+def render(r, subject=None, heartbeat_days=HEARTBEAT_DAYS):
     """人类可读的两行（结论 + 心跳）。心跳那一行**总是**打印 —— 它是正交输出。"""
-    lines = ["结论: %s  退出码 %d" % (r["state"], r["exit"]),
-             "       %s" % r["reason"]]
-    if r["heartbeat_due"]:
+    lines = ["结论: %s  退出码 %d" % (r.state, r.exit), "       %s" % r.reason]
+    if r.heartbeat_due:
         lines.append("心跳: 到期 —— 该往孤儿分支写一个心跳提交（与本次有没有漂移无关）")
+    elif r.heartbeat_age_days is None:
+        # 走不到（没记录过就必然到期）；留着是为了让「未到期」那行**不可能**打印出 None
+        lines.append("心跳: 未到期")
     else:
-        left = HEARTBEAT_DAYS - r["heartbeat_age_days"]
-        lines.append("心跳: 未到期（%s 天前，还有 %d 天）" % (r["heartbeat_age_days"], left))
-    if r["marker"] != MARKER_OK:
-        lines.append("标记: %s（%s）" % (r["marker"], r["marker_note"]))
+        lines.append("心跳: 未到期（%s 天前，还有 %d 天）"
+                     % (r.heartbeat_age_days, heartbeat_days - r.heartbeat_age_days))
+    if r.marker != MARKER_OK:
+        lines.append("标记: %s（%s）" % (r.marker, r.marker_note))
     if subject:
-        lines.append("上游: %s  %s" % (r["upstream"][:12], subject))
+        lines.append("上游: %s  %s" % (r.upstream[:12], subject))
     return "\n".join(lines)
 
 
@@ -316,7 +355,7 @@ CASES = [
     ("标记是另一个提交 ⇒ 不拉黑", BL % J3, J2, J1, ID_DRIFTED, 10, False),
     ("只有失败标记、没有心跳字段 ⇒ 拉黑优先，心跳那行说到期", NO_HB % J2, J2, J1,
      ID_BLACKLISTED, 20, True),
-    # —— 损坏兜底：一律按「无标记」继续，绝不停摆；能解析出来的那一半仍然算数 ——
+    # —— 损坏兜底：`failed` 坏了 ⇒ 按无标记继续，绝不停摆 ——
     ("标记文件为空 ⇒ 按无标记（有漂移就构建）", "", J2, J1, ID_DRIFTED, 10, True),
     ("合法但只记了心跳 ⇒ 无失败标记", '{"heartbeat": {"at": "2026-09-24"}}', J2, J1,
      ID_DRIFTED, 10, False),
@@ -330,17 +369,35 @@ CASES = [
      J2, J1, ID_DRIFTED, 10, False),
     ("标记文件损坏（failed 是字符串）",
      '{"failed": "oops", "heartbeat": {"at": "2026-09-24"}}', J2, J1, ID_DRIFTED, 10, False),
-    ("标记文件损坏（heartbeat 缺 at）", '{"heartbeat": {}}', J2, J1, ID_DRIFTED, 10, True),
     ("标记文件损坏 + 同一提交 + 心跳未到期 ⇒ 仍重试（不拉黑）",
      '{"failed": {"upstream": "%s", "at": "2026/09/22"}, "heartbeat": {"at": "2026-09-24"}}' % J2,
      J2, J1, ID_DRIFTED, 10, False),
+    # —— 只有 heartbeat 坏：拉黑照旧（`failed` 完好），心跳按「从未记录」算 ——
+    ("只有 heartbeat 写坏（是空对象）⇒ 拉黑照旧、心跳说到期",
+     '{"failed": {"upstream": "%s", "at": "2026-09-22"}, "heartbeat": {}}' % J2,
+     J2, J1, ID_BLACKLISTED, 20, True),
+    ("只有 heartbeat 写坏（不是对象）⇒ 拉黑照旧",
+     '{"failed": {"upstream": "%s", "at": "2026-09-22"}, "heartbeat": 7}' % J2,
+     J2, J1, ID_BLACKLISTED, 20, True),
+    ("只有 heartbeat 写坏（日期写坏）⇒ 拉黑照旧，心跳那行说到期（良性代价）",
+     '{"failed": {"upstream": "%s", "at": "2026-09-22"}, "heartbeat": {"at": "2026/09/24"}}' % J2,
+     J2, J1, ID_BLACKLISTED, 20, True),
+    ("标记是别的提交 + heartbeat 写坏 ⇒ 有漂移，照常构建",
+     '{"failed": {"upstream": "%s", "at": "2026-09-22"}, "heartbeat": {}}' % J3,
+     J2, J1, ID_DRIFTED, 10, True),
     ("标记文件损坏 + 心跳 40 天 ⇒ 心跳仍判到期（半个标记也算数）",
      '{"failed": "oops", "heartbeat": {"at": "2026-08-16"}}', J1, J1, ID_HEARTBEAT, 30, True),
 ]
 
 
 def self_test(tmpdir):
-    """跑上面的表。返回失败条数。**任何一条不符就报错并列出期望/实际**。"""
+    """跑上面的表。返回失败条数。**任何一条不符就报错并列出期望/实际**。
+
+    除了四元组（结论 / 退出码 / 心跳 / 标记分类），还断言一条**不变量**：
+    **输出里打印了「按无标记处理」的行，就绝不可能同时判 `blacklisted`。**
+    这条不变量是 code-review 逼出来的 —— 第一版正是「输出说要重试、退出码却是 20」。
+    没有它，那类自相矛盾只能靠人读日志发现。
+    """
     bad, today = 0, datetime.date(2026, 9, 25)
     os.makedirs(tmpdir, exist_ok=True)
     print("表驱动自测：%d 条用例，今天 = %s，窗口 = 标记 %d 天 / 心跳 %d 天"
@@ -357,23 +414,27 @@ def self_test(tmpdir):
                 f.write(marker)
         try:
             r = check(up, LOCAL, mb, path, today)
+            shown = render(r)                       # 调用方真正会看到的那些行
         except Exception as e:                       # 崩溃本身就是不合格
             print("  ❌ #%-2d %s\n       抛异常：%r" % (i, what, e))
             bad += 1
             continue
-        got = (r["state"], r["exit"], r["heartbeat_due"])
-        want = (want_id, want_exit, want_hb)
-        # 标称「损坏」的用例还要确认它**真的被判成损坏**（而不是悄悄当成合法文件）
-        if "损坏" in what and r["marker"] != MARKER_BROKEN:
-            print("  ❌ #%-2d %s\n       标记分类应为「%s」，实际「%s」" % (i, what, MARKER_BROKEN, r["marker"]))
+        got = (r.state, r.exit, r.heartbeat_due, r.marker)
+        want = (want_id, want_exit, want_hb,
+                MARKER_BROKEN if ("损坏" in what and "heartbeat" not in what) else None)
+        problems = []
+        if got[:3] != want[:3]:
+            problems.append("期望 %s，实际 %s" % (want[:3], got[:3]))
+        if want[3] and r.marker != want[3]:
+            problems.append("标记分类应为「%s」，实际「%s」" % (want[3], r.marker))
+        if "按**无标记**处理" in shown and r.state == ID_BLACKLISTED:
+            problems.append("自相矛盾：既说按无标记处理，又判 blacklisted")
+        if problems:
             bad += 1
-            continue
-        if got == want:
-            print("  ✅ #%-2d %-48s -> %s / %d / 心跳%s"
-                  % (i, what[:48], r["state"], r["exit"], "到期" if r["heartbeat_due"] else "未到期"))
+            print("  ❌ #%-2d %s\n       %s" % (i, what, "\n       ".join(problems)))
         else:
-            bad += 1
-            print("  ❌ #%-2d %s\n       期望 %s\n       实际 %s" % (i, what, want, got))
+            print("  ✅ #%-2d %-48s -> %s / %d / 心跳%s"
+                  % (i, what[:48], r.state, r.exit, "到期" if r.heartbeat_due else "未到期"))
     print()
     print("结果: %s（%d/%d 通过）" % ("失败" if bad else "全部通过", len(CASES) - bad, len(CASES)))
     return bad
@@ -423,15 +484,18 @@ def main(argv):
 
     r = check(a.upstream, a.local, a.merge_base, a.marker, today, a.expire_days, a.heartbeat_days)
     if a.json:
-        print(json.dumps(r, ensure_ascii=False, indent=1, default=str))
+        print(json.dumps(r._asdict(), ensure_ascii=False, indent=1, default=str))
     else:
-        print(render(r, a.upstream_subject))
-        if r["marker"] == MARKER_BROKEN:
+        print(render(r, a.upstream_subject, a.heartbeat_days))
+        if r.marker == MARKER_BROKEN:
             # 必须说清「哪坏了」以及为什么它不致命 —— 否则这行会被读成噪音
-            print("⚠️  标记文件损坏，按**无标记**处理：%s" % r["marker_note"])
+            print("⚠️  标记文件损坏，按**无标记**处理：%s" % r.marker_note)
             print("    代价是可能重试一个已被拉黑的提交；不这样做的代价是损坏文件永久卡死检测器。")
             print("    能解析出来的那一半仍然算数（例如心跳时间）。")
-    return r["exit"]
+        elif r.marker_note.startswith("`heartbeat` 写坏"):
+            # 这一种**不是**「按无标记处理」：拉黑判定不受影响，只说清丢了什么
+            print("⚠️  %s" % r.marker_note)
+    return r.exit
 
 
 if __name__ == "__main__":
