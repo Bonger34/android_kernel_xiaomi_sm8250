@@ -110,6 +110,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from typing import NamedTuple
 
 EXIT_OK = 0
 EXIT_RUN = 1
@@ -129,7 +130,7 @@ DEPTH_ROUNDS = 12
 UPSTREAM_DEFAULT = "LineageOS/android_kernel_xiaomi_sm8250"
 
 
-def run(argv, cwd=None, env=None, binary=False):
+def run(argv, cwd=None, env=None):
     """跑一条命令并取回 `(rc, stdout, stderr)`。
 
     ⚠️ **为什么把输出落临时文件，而不是用 `capture_output=True`**：
@@ -145,9 +146,8 @@ def run(argv, cwd=None, env=None, binary=False):
         p = subprocess.run(argv, cwd=cwd, env=env, stdout=out, stderr=err)
         out.seek(0)
         err.seek(0)
-        enc = None if binary else "utf-8"
         return (p.returncode,
-                out.read().decode(enc or "utf-8", "replace"),
+                out.read().decode("utf-8", "replace"),
                 err.read().decode("utf-8", "replace"))
     finally:
         out.close()
@@ -292,6 +292,42 @@ def ensure_history(a, log):
            DEPTH_STEP * DEPTH_ROUNDS))
 
 
+class MergeTree(NamedTuple):
+    """`git merge-tree` 一次运行的三选一结论：`ok` / `conflict` / `error`。"""
+
+    state: str
+    tree: str
+    conflicted: list
+    notes: str
+
+
+def parse_merge_tree(rc, out, err):
+    """把 `git merge-tree --write-tree --name-only` 的输出分成三类。
+
+    ⚠️ **只有退出码 1 是「有冲突」，其余非零是 git 自己 die 了**（128 之类）。
+    第一版把「任何非零」都当成冲突，于是「对象损坏 / 仓库坏了」会被报成
+    「上游与本线改到同一处」—— 一句**看着很确定、其实完全不对**的结论，
+    而且它会进运行摘要（`docs/PROJECT.md` §7 坑表 #32/#34 那一族）。
+
+    输出形态（`git-merge-tree(1)` 的 OUTPUT 一节）：**分节、空行分隔** ——
+    第 1 节 = 顶层 tree OID + 冲突文件清单（`--name-only` 形态），
+    第 2 节 = 说明性消息（`Auto-merging…` / `CONFLICT…`），只在有内容时出现。
+    单独抽成纯函数是为了**能离线断言这三种分类**，而不是靠造一个坏仓库。
+    """
+    sections = out.split("\n\n")
+    head = [l for l in sections[0].splitlines() if l.strip()] if sections else []
+    notes = "\n".join(s.strip() for s in sections[1:] if s.strip())
+    tree = head[0].strip() if head else ""
+    if rc == 1:
+        return MergeTree("conflict", tree,
+                         sorted(l.strip() for l in head[1:] if l.strip()), notes)
+    if rc != 0:
+        return MergeTree("error", "", [], (err or out).strip())
+    if len(tree) != 40:
+        return MergeTree("error", "", [], "merge-tree 没给出合并后的 tree：%r" % out[:400])
+    return MergeTree("ok", tree, [], notes)
+
+
 def merge_env(upstream_sha, repo):
     """钉死 author/committer 的身份与日期。日期 = **上游提交的 committer date**。
 
@@ -370,16 +406,14 @@ def run_merge(a, log):
         "repo_dir": repo, "work_branch": a.work_branch or head_branch,
         "local_sha": local_sha, "upstream_sha": a.upstream_sha,
         "upstream_url": a.upstream_url, "checked_out": bool(a.checkout),
-        "merge_base": a.merge_base, "merge_base_expected": a.merge_base,
+        "merge_base": a.merge_base,
         "merge_sha": None, "merge_date": None,
-        "detached": bool(a.checkout and head_branch != "HEAD"),
     }
 
-    # ── ③ 上游提交必须在；不在就取（唯一联网的一步）──
-    if not have(repo, a.upstream_sha):
-        mb = ensure_history(a, log)
-    else:
-        mb = merge_base_of(repo, local_sha, a.upstream_sha)
+    # ── ③ 上游提交与共同祖先都得在；不在就取（唯一联网的一步）──
+    #    `ensure_history()` 自己带「本地已有就不联网」的快路径，所以这里先试一次本地，
+    #    拿不到再交给它 —— 两处不要各写一遍同样的判断。
+    mb = merge_base_of(repo, local_sha, a.upstream_sha)
     if mb is None:
         mb = ensure_history(a, log)
     if mb is None:
@@ -424,34 +458,30 @@ def run_merge(a, log):
     rc, out, err = run(["git", "-c", "merge.renames=true", "-c", "merge.directoryRenames=true",
                         "merge-tree", "--write-tree", "--name-only",
                         "--merge-base=" + a.merge_base, local_sha, a.upstream_sha], cwd=repo)
-    # 输出是「分节、空行分隔」的（`git-merge-tree(1)` 的 OUTPUT 一节）：
-    #   第 1 节 = 顶层 tree OID + **冲突文件清单**（`--name-only` 形态）
-    #   第 2 节 = 说明性消息（Auto-merging… / CONFLICT…），只在有内容时出现
-    sections = out.split("\n\n")
-    head = [l for l in sections[0].splitlines() if l.strip()] if sections else []
-    notes = "\n".join(s.strip() for s in sections[1:] if s.strip())
-    tree = head[0].strip() if head else ""
+    mt = parse_merge_tree(rc, out, err)
 
-    if rc != 0:
-        conflicted = sorted(l.strip() for l in head[1:] if l.strip())
-        result.update(exit_code=EXIT_CONFLICT, state="conflict", conflicted=conflicted,
+    if mt.state == "error":
+        # ⚠️ 与「冲突」分开报：git 自己 die 了（对象损坏 / 参数不被支持…）不是
+        #    「上游与本线改到同一处」，把后者写进摘要会把人引到完全错的方向。
+        raise RuntimeError("merge-tree 失败了（**不是冲突**）：\n    %s" % mt.notes[:600])
+    if mt.state == "conflict":
+        result.update(exit_code=EXIT_CONFLICT, state="conflict", conflicted=mt.conflicted,
                       head_after=local_sha)
-        log("❌ 合并冲突（%d 个文件）" % len(conflicted))
-        for f in conflicted[:12]:
+        log("❌ 合并冲突（%d 个文件）" % len(mt.conflicted))
+        for f in mt.conflicted[:12]:
             log("     %s" % f)
-        if len(conflicted) > 12:
-            log("     …（还有 %d 个）" % (len(conflicted) - 12))
-        if not conflicted:
+        if len(mt.conflicted) > 12:
+            log("     …（还有 %d 个）" % (len(mt.conflicted) - 12))
+        if not mt.conflicted:
             log("     （merge-tree 没列出冲突文件，原始输出：%s）" % (out or err).strip()[:400])
-        for line in notes.splitlines()[:12]:
+        for line in mt.notes.splitlines()[:12]:
             log("     ｜ %s" % line)
         log("   上游 %s 与本线 %s 在同一个文件的同一处都改过。" % (a.upstream_sha[:12], local_sha[:12]))
         log("   ⇒ 按规格「冲突即干净失败」：**不推送、不留半成品、不触发构建**。")
         log("     处理这件事的是人：手工解冲突并推一次，或等上游自己修。")
         log("   ⚠️ 本次**没有**改动工作区（merge-tree 只算不写）—— HEAD 仍是 %s" % local_sha[:12])
         return result
-    if not tree or len(tree) != 40:
-        raise RuntimeError("merge-tree 没有给出合并后的 tree（输出：%r）" % out[:400])
+    tree = mt.tree
 
     env, iso = merge_env(a.upstream_sha, repo)
     result["merge_date"] = iso
@@ -526,7 +556,7 @@ def render_summary(r):
               + ("（合并提交造在 detached HEAD 上）" if r.get("checked_out")
                  else "（`--no-checkout`：只在对象库里造了合并提交，工作区与 HEAD 都没碰）"), ""]
     elif r["state"] == "conflict":
-        L += ["| **结论** | **冲突**（已 abort，分支未动）|", ""]
+        L += ["| **结论** | **冲突**（工作区未改动，分支未动）|", ""]
         L += ["冲突的文件："] + ["- `%s`" % f for f in r.get("conflicted", [])] + [""]
         L += ["按规格「冲突即干净失败」：不推送、不留半成品、**不触发构建**。", ""]
     elif r["state"] == "no-drift":
@@ -720,7 +750,7 @@ def self_test(tmpdir):
     # ⑧ 冲突 ⇒ 退出码 4，abort + 回退，分支不动
     d8 = os.path.join(tmpdir, "conflict")
     a8, work8, up8 = _init_conflict_repo(d8)
-    r8 = case("⑧ 冲突 ⇒ 退出码 4 + abort + 回退", EXIT_CONFLICT,
+    r8 = case("⑧ 冲突 ⇒ 退出码 4（工作区未改动）", EXIT_CONFLICT,
               Args(repo_dir=d8, upstream_sha=up8, merge_base=a8, work_branch="work"),
               state="conflict", head_after=work8, _refs={"work": work8})
     n[0] += 1
@@ -798,6 +828,29 @@ def self_test(tmpdir):
         case("⑮ 之后改用 --checkout 仍得到同一个 sha", EXIT_OK,
              Args(repo_dir=d14, upstream_sha=up14, merge_base=a14, work_branch="work",
                   expect_merge_sha=r14["merge_sha"]), state="merged")
+
+    # ⑯ `parse_merge_tree` 的三种分类 —— **纯函数，所以三种都能离线断言**。
+    #    这一条是 code-review 抓出来的：第一版把「任何非零退出」都当成冲突，
+    #    于是 git 自己 die（128）会被写成「上游与本线改到同一处」。
+    ok_out = "0" * 40 + "\n"
+    cf_out = ("6" * 40 + "\nboth.txt\n\n"
+              "Auto-merging both.txt\nCONFLICT (content): Merge conflict in both.txt\n")
+    cases = (
+        ("⑯a rc=0 ⇒ ok，tree 取第一行", (0, ok_out, ""), "ok", "0" * 40, []),
+        ("⑯b rc=1 ⇒ conflict，列出冲突文件（说明性消息不混进来）",
+         (1, cf_out, ""), "conflict", "6" * 40, ["both.txt"]),
+        ("⑯c rc=128 ⇒ error（**不是**冲突）", (128, "", "fatal: bad object"),
+         "error", "", []),
+        ("⑯d rc=0 但第一行不是 tree ⇒ error", (0, "乱七八糟\n", ""), "error", "", []),
+    )
+    for what, (rc, out, err), want_state, want_tree, want_files in cases:
+        n[0] += 1
+        mt = parse_merge_tree(rc, out, err)
+        if (mt.state, mt.tree, mt.conflicted) == (want_state, want_tree, want_files):
+            print("  ✅ #%-2d %-46s -> %s" % (n[0], what[:46], mt.state))
+        else:
+            fail(what, "期望 %s/%s/%s，实际 %s/%s/%s"
+                 % (want_state, want_tree[:8], want_files, mt.state, mt.tree[:8], mt.conflicted))
 
     total = n[0]
     print()

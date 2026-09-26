@@ -148,12 +148,19 @@ def render(ctx):
     if ctx["run_url"]:
         A("| CI run | %s |" % ctx["run_url"])
     A("")
-    A("⚠️ **「构建提交」是哪一种，看上面的「对应的上游提交」那一栏**：")
-    A("")
-    A("- 有上游提交 ⇒ 它是一次**合并提交**（由上游同步通道自动试合并出来的），")
-    A("  它**不在任何分支上** —— 规格要求「绝不 push」，分支要等构建全绿才前进；")
-    A("  它的两个父提交就是本线分支 HEAD 与那个上游提交，committer date 锚定到后者。")
-    A("- 没有上游提交 ⇒ 它就是本线分支 HEAD（手动 `workflow_dispatch` 的常规情形）。")
+    if ctx["merge_sha"]:
+        # ⚠️ 这一栏由 `--merge-sha` 决定，**不是**由「有没有上游提交」推断出来的：
+        #    两者不一致时上游那段说明会说错话（把分支 HEAD 说成一次合并提交）。
+        A("⭐ **它就是那次「试合并」的合并提交**（`--merge-sha` 与 `--commit` 逐字相同，"
+          "生成本文件时核过）。")
+        A("")
+        A("- 它**不在任何分支上** —— 规格要求「绝不 push」，分支要等构建全绿才前进；")
+        A("- 它的两个父提交是本线分支 HEAD 与那个上游提交，committer date 锚定到后者"
+          "（同一个上游状态下，哪一天构建出的字节都一样）；")
+        A("- 它在检测器与两个 build job 里各被**重放一次**，三处算出的 sha 必须相同。")
+    else:
+        A("⚠️ **没有 `--merge-sha` ⇒ 它就是本线分支 HEAD**（手动 `workflow_dispatch` 的常规情形，"
+          "本次没有合并上游）。")
     A("")
     A("⚠️ **本批次从未在真机上刷过** —— 「root 是否真的可用」在本线一贯**未证实**。")
     A("")
@@ -170,8 +177,21 @@ def render(ctx):
     A("| sha256 | `%s` |" % ctx["base"]["sha256"])
     if ctx["fetch"]:
         ok = ctx["fetch"]["sha256"] == ctx["base"]["sha256"]
-        A("| 官方公布 | `%s` %s |" % (ctx["fetch"]["sha256"],
-                                      "✅ 与实际下载件逐字相同" if ok else "❌ 与实际下载件**不符**"))
+        # ⚠️ 这一行的**标签要说实话**：`fetch-base.py` 现拉时那一行是**官方 API 公布的**值，
+        #    而「复用某次 run 的底包」那条路（#8 的检测器分发）写下的是 **artifact 自己**的长度
+        #    与哈希 ⇒ 那时这一行就是**自算值自比**，标成「官方公布」会让人以为核过一次官方值
+        #    （坑表 #26 同款：拿文件跟自己比）。真正的官方值核在**检测器**那一步，
+        #    而它算出的那个 sha256 由 `base_sha256` 入参传下来、在 `prepare` 里复算核对。
+        src = ctx["fetch"]["url"]
+        label = "官方公布" if src.startswith("http") else "那次 run 的 artifact 记下的"
+        A("| %s | `%s` %s |" % (label, ctx["fetch"]["sha256"],
+                                "✅ 与实际下载件逐字相同" if ok else "❌ 与实际下载件**不符**"))
+        if not src.startswith("http"):
+            A("")
+            A("⚠️ 这一批用的是**检测器取的那份 artifact**（`%s`），不是本机现拉的。" % src)
+            A("   「它与官方 API 公布的值一致」这件事是在**检测器**那一步核的 ——")
+            A("   检测器把当时算出的 sha256 作为 `base_sha256` 传给了本 run，而 `prepare` 复算了它。")
+            A("   本文件写不出那个官方值（它没有原始日志），所以这里只记 artifact 自己的哈希。")
     A("")
     A("底包只用于取 ramdisk / dtb / vbmeta / 头 —— **壳里的那个内核会被整个换掉**。")
     A("⚠️ 本文件是这份底包唯一的记录：artifact 90 天过期后，谁也重建不了它（规格的实现决定 4）。")
@@ -232,6 +252,9 @@ def main(argv):
     ap.add_argument("--commit", default="（未记录）")
     ap.add_argument("--upstream-sha", default="",
                     help="本批次**对应的上游提交**（#8 起由检测器传入；手动触发时通常为空）")
+    ap.add_argument("--merge-sha", default="",
+                    help="本批次构建的那个**合并提交**（#8 的检测器传入）。给了就与 --commit 核，"
+                         "且说明文字按「这是一次合并提交」写；不给则按「就是分支 HEAD」写")
     ap.add_argument("--run-url", default="")
     ap.add_argument("--gate", default="（未记录）")
     ap.add_argument("--repro", default="未做 —— 两次构建逐字节比对由 issue #6 负责。")
@@ -256,6 +279,18 @@ def main(argv):
 
     fetch = parse_fetch_log(a.fetch_log) if a.fetch_log else None
     base = {"size": os.path.getsize(a.base), "sha256": sha256_file(a.base)}
+
+    # ★ 上游同步通道（#8）：`--merge-sha` 与 `--commit` 必须是**同一个提交**。
+    #   规格要求「绝不 push」⇒ 那次合并**不在任何分支上**，它就是被构建的那个提交
+    #   （build job 会用 `--expect-merge-sha` 核对它）。两个值不一致说明调用方把参数传错了，
+    #   而下面那段说明文字会因此**说错话**（把分支 HEAD 说成一次合并提交）——
+    #   错的来源说明比没有来源说明更坏。
+    if a.merge_sha and a.merge_sha != a.commit:
+        print("❌ --merge-sha 与 --commit 不是同一个提交：")
+        print("   --merge-sha %s" % a.merge_sha)
+        print("   --commit    %s" % a.commit)
+        print("   ⇒ 上游同步通道构建的就是那次合并（它不在任何分支上）⇒ 两个值必须相同。")
+        return 1
 
     # ★ 这就是 issue #5 的验收之一：「来源说明里的底包 sha256 与实际下载到的那份一致」。
     #   官方公布了值、而实际字节不符 ⇒ 当场失败，绝不写一份自相矛盾的说明。
@@ -298,7 +333,7 @@ def main(argv):
 
     img_sha = dict((n, h) for n, _s, h in files)[img]
     ctx = {"repo": a.repo, "branch": a.branch, "commit": a.commit, "run_url": a.run_url,
-           "upstream_sha": a.upstream_sha,
+           "upstream_sha": a.upstream_sha, "merge_sha": a.merge_sha,
            "fetch": fetch, "base": base, "files": files,
            "image_sha": img_sha, "same_source": same_source,
            "gate": a.gate, "repro": a.repro}
@@ -346,6 +381,14 @@ def _zip_with_image(path, kernel):
 
 FETCH_OK = """期次   2026-09-20
 来源   https://mirrorbits.lineageos.org/full/umi/20260920/boot.img
+官方   {size} 字节  sha256 {sha}
+输出   base.img
+"""
+
+# 「复用某次 run 的底包」那条路写下的日志（#8：检测器取一次、两个 build job 共用）。
+# ⚠️ 它的长度与哈希取自 **artifact 自己** ⇒ 那一行的标签不许写成「官方公布」。
+FETCH_REUSE = """期次   2026-09-20
+来源   artifact:36267894542/base-img-d892a55c
 官方   {size} 字节  sha256 {sha}
 输出   base.img
 """
@@ -400,6 +443,59 @@ def self_test():
         return "0，%d 个产物的哈希全部现算入文" % (len(os.listdir(d)) - 2)
 
     case("正向：生成并覆盖全部文件", c1)
+
+    # ①b `--merge-sha`（#8）：与 `--commit` 相同 ⇒ 说明文字按「这是一次合并提交」写；
+    #     两者不同 ⇒ **失败且不写文件**（错的来源说明比没有来源说明更坏）。
+    def c1b(tmp):
+        base, d, _ki = _setup(tmp)
+        log = os.path.join(tmp, "fetch.log")
+        _touch(log, FETCH_OK.format(sha=sha256_file(base), size=os.path.getsize(base)).encode())
+        sha = "a" * 40
+        rc, txt = run(base, d, log, extra=["--commit", sha, "--merge-sha", sha,
+                                           "--upstream-sha", "b" * 40])
+        assert rc == 0, "合并提交与构建提交相同时应当成功，得到 %r" % (rc,)
+        assert "合并提交" in txt and "不在任何分支上" in txt, "说明文字没按「合并提交」写"
+        d2 = os.path.join(tmp, "dist2")
+        shutil.copytree(d, d2)
+        # ⚠️ 第一次那一遍已经写出了一份说明 ⇒ 先删掉，否则下面那条
+        #    「失败时不该留下来源说明」会**永远通过**（它看到的是上一轮留下的文件）。
+        os.remove(os.path.join(d2, SELF))
+        rc2, _txt2 = run(base, d2, log, extra=["--commit", "c" * 40, "--merge-sha", sha])
+        assert rc2 == 1, "两个值不同时应当失败，得到 %r" % (rc2,)
+        assert SELF not in os.listdir(d2), "失败时不该留下来源说明"
+        return "相符 ⇒ 写成合并提交；不符 ⇒ 1 且不写文件"
+
+    case("正向：--merge-sha 与 --commit 相符 / 不符", c1b)
+
+    # ①c 不给 `--merge-sha` ⇒ 说明文字**不许**声称它是一次合并提交
+    #     （手动触发就是这种：构建的是分支 HEAD，而 `--upstream-sha` 可能仍被记着）
+    def c1c(tmp):
+        base, d, _ki = _setup(tmp)
+        log = os.path.join(tmp, "fetch.log")
+        _touch(log, FETCH_OK.format(sha=sha256_file(base), size=os.path.getsize(base)).encode())
+        rc, txt = run(base, d, log, extra=["--commit", "c" * 40, "--upstream-sha", "b" * 40])
+        assert rc == 0, "得到 %r" % (rc,)
+        assert "合并提交" not in txt, "没给 --merge-sha 就不该说它是合并提交"
+        assert "就是本线分支 HEAD" in txt, "应当明说它就是分支 HEAD"
+        return "0，明说「就是本线分支 HEAD」"
+
+    case("正向：不给 --merge-sha ⇒ 不说成合并提交", c1c)
+
+    # ①d 复用的那条日志（来源是 `artifact:…`）⇒ **不许**把自算值标成「官方公布」，
+    #     且要说清「与官方一致」这件事是在检测器那一步核的（坑表 #26 同款：拿文件跟自己比）
+    def c1d(tmp):
+        base, d, _ki = _setup(tmp)
+        log = os.path.join(tmp, "fetch.log")
+        _touch(log, FETCH_REUSE.format(sha=sha256_file(base),
+                                       size=os.path.getsize(base)).encode())
+        rc, txt = run(base, d, log)
+        assert rc == 0, "得到 %r" % (rc,)
+        assert "官方公布" not in txt, "复用的日志里那个哈希是 artifact 自算的，不许标成官方公布"
+        assert "那次 run 的 artifact 记下的" in txt, "应当换一个诚实的标签"
+        assert "在**检测器**那一步核的" in txt, "应当说清官方值是在哪一步核的"
+        return "0，标签换成「那次 run 的 artifact 记下的」并说明官方值在哪核"
+
+    case("正向：复用的底包不冒充「官方公布」", c1d)
 
     # ② 官方 sha256 与实际下载件不符 ⇒ 1，且**不写文件**
     def c2(tmp):

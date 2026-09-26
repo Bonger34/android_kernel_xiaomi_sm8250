@@ -72,6 +72,7 @@ TRIES = 3
 EXIT_OK = 0
 EXIT_RUN = 1
 EXIT_USAGE = 2
+TRIES = 3
 
 
 class Usage(RuntimeError):
@@ -88,15 +89,13 @@ class Api:
     而各自需要的东西只有这几十行。判定逻辑（`sync-check.py`）才是值得共用的那一层。
     """
 
-    def __init__(self, token=None, timeout=TIMEOUT, tries=TRIES):
+    def __init__(self, token=None):
         self.token = token
-        self.timeout = timeout
-        self.tries = tries
 
     def call(self, method, path, payload=None):
         """返回 `(status, 解析后的 JSON)`。**204 是正常结果**（dispatch 就是 204 无正文）。"""
         last = None
-        for i in range(self.tries):
+        for i in range(TRIES):
             try:
                 return self._one(method, path, payload)
             except urllib.error.HTTPError as e:
@@ -105,11 +104,10 @@ class Api:
                 last = e
             except Exception as e:                       # 网络层（超时、DNS、TLS…）
                 last = e
-            if i + 1 < self.tries:
+            if i + 1 < TRIES:
                 import time
                 time.sleep(2 * (i + 1))
-        raise RuntimeError("%s %s 失败（重试 %d 次）：%r"
-                           % (method, path, self.tries, last))
+        raise RuntimeError("%s %s 失败（重试 %d 次）：%r" % (method, path, TRIES, last))
 
     def _one(self, method, path, payload):
         url = "%s/%s" % (API_DEFAULT, path.lstrip("/"))
@@ -121,7 +119,7 @@ class Api:
             req.add_header("Content-Type", "application/json")
         if self.token:
             req.add_header("Authorization", "Bearer " + self.token)
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
             body = r.read()
         return r.status, (json.loads(body.decode("utf-8")) if body.strip() else {})
 
@@ -146,10 +144,12 @@ def parse_inputs(pairs):
     return out
 
 
-def preflight(api, repo, workflow, ref, default_branch_ok=True, log=print):
-    """派发前的三条只读检查（规格实现决定 1 的硬性条件）。
+def preflight(api, repo, workflow, log=print):
+    """派发前的只读检查（规格实现决定 1 的硬性条件）。
 
-    返回 `(workflow_path, default_branch)`；任何一条不满足都抛 `Usage`。
+    返回 workflow 在仓库里的路径；任何一条不满足都抛 `Usage`。
+    ⚠️ `ref` **不在这里检查**：平台的这三条前提与 ref 无关，
+    而「ref 存不存在」由派发那一步用 404/422 当场回答（多一次 GET 换不来更多信息）。
     """
     st, wf = api.call("GET", "repos/%s/actions/workflows/%s" % (repo, urllib.parse.quote(workflow)))
     if st == 404:
@@ -171,24 +171,22 @@ def preflight(api, repo, workflow, ref, default_branch_ok=True, log=print):
             "      构建器只带 `workflow_dispatch`，它被停用一定是**人**干的。" % (path, state))
     log("   workflow   %s  state=%s" % (path, state))
 
-    if default_branch_ok:
-        st, doc = api.call("GET", "repos/%s" % repo)
-        if st >= 400:
-            raise Usage("读仓库信息失败（HTTP %d）" % st)
-        default = doc.get("default_branch")
-        st, cnt = api.call("GET", "repos/%s/contents/%s?ref=%s"
-                           % (repo, urllib.parse.quote(path), urllib.parse.quote(default or "")))
-        if st == 404:
-            raise Usage(
-                "workflow 文件 %s **不在默认分支 %s 上** —— 这是 `workflow_dispatch` 的硬性前提之一\n"
-                "   （规格实现决定 1：被触发的 workflow 文件必须存在于默认分支上且带 `on: workflow_dispatch`）。\n"
-                "   ⇒ 把它合并 / 推到默认分支之后再派发；否则平台只会回一个看不出所以然的 404。"
-                % (path, default))
-        if st >= 400:
-            raise Usage("读默认分支上的 %s 失败（HTTP %d）" % (path, st))
-        log("   默认分支    %s 上有这个文件 ✅" % default)
-        return path, default
-    return path, None
+    st, doc = api.call("GET", "repos/%s" % repo)
+    if st >= 400:
+        raise Usage("读仓库信息失败（HTTP %d）" % st)
+    default = doc.get("default_branch")
+    st, _cnt = api.call("GET", "repos/%s/contents/%s?ref=%s"
+                        % (repo, urllib.parse.quote(path), urllib.parse.quote(default or "")))
+    if st == 404:
+        raise Usage(
+            "workflow 文件 %s **不在默认分支 %s 上** —— 这是 `workflow_dispatch` 的硬性前提之一\n"
+            "   （规格实现决定 1：被触发的 workflow 文件必须存在于默认分支上且带 `on: workflow_dispatch`）。\n"
+            "   ⇒ 把它合并 / 推到默认分支之后再派发；否则平台只会回一个看不出所以然的 404。"
+            % (path, default))
+    if st >= 400:
+        raise Usage("读默认分支上的 %s 失败（HTTP %d）" % (path, st))
+    log("   默认分支    %s 上有这个文件 ✅" % default)
+    return path
 
 
 def trigger(a, api, log=print):
@@ -205,7 +203,7 @@ def trigger(a, api, log=print):
     if not a.ref or not a.ref.strip():
         raise Usage("--ref 不能为空（它决定这次构建检出哪个提交）")
 
-    path, _ = preflight(api, a.repo, a.workflow, a.ref, log=log)
+    path = preflight(api, a.repo, a.workflow, log=log)
     log("   ref        %s" % a.ref)
     for k in sorted(inputs):
         log("   input      %s=%s" % (k, inputs[k] or "（空）"))
@@ -368,7 +366,8 @@ def main(argv):
                     help="workflow_dispatch 的入参，可重复")
     ap.add_argument("--require", action="append", default=[], metavar="NAME",
                     help="这些入参必须存在且非空，否则**一个请求都不发**；可重复")
-    ap.add_argument("--dry-run", action="store_true", help="只做只读预检并打印请求体，不派发")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="只做只读预检并打印请求体，不派发（⚠️ 预检里的读接口仍需凭据）")
     ap.add_argument("--json-out", metavar="文件", help="把结果写一份 JSON")
     ap.add_argument("--self-test", action="store_true", help="离线跑内置用例（假 API，不联网）")
     a = ap.parse_args(argv[1:])
@@ -380,8 +379,13 @@ def main(argv):
         return EXIT_USAGE
 
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    if not token and not a.dry_run:
-        print("⚠️ 环境里没有 GH_TOKEN / GITHUB_TOKEN —— 派发需要凭据（本项目不用 PAT）。")
+    if not token:
+        # ⚠️ 没有凭据时**直接失败**，别只 warn 一句再发请求：未认证的 dispatch 端点回的是
+        #    404，而 404 在本工具里被解释成「workflow 或 ref 不存在」—— 一条**看着很确定、
+        #    其实完全不对**的结论。凭据只从环境变量来（本项目不用 PAT，见文件头）。
+        print("❌ 环境里没有 GH_TOKEN / GITHUB_TOKEN —— 派发需要凭据"
+              "（CI 里传的是 `${{ github.token }}`；本项目不用 PAT）。")
+        return EXIT_USAGE
     try:
         r = trigger(a, Api(token), log=print)
     except Usage as e:

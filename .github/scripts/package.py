@@ -22,7 +22,7 @@
   python .github/scripts/package.py --image <Image> --config <.config> --system-map <System.map> \\
       --base <底包.img> --template <AK3 模板.tar.gz> --out-dir <产物目录> \\
       [--template-sha256 SHA] [--repo R] [--branch B] [--commit SHA] [--upstream-sha SHA] \\
-      [--run-url URL] [--fetch-log <fetch-base.py 的输出>] \\
+      [--merge-sha SHA] [--run-url URL] [--fetch-log <fetch-base.py 的输出>] \\
       [--line-name LOS23.2] [--ksu-version 0.9.5] [--device umi]
 
 退出码: 本脚本**没有自己的退出码** —— 它返回**失败那一步的**退出码（原样透传），
@@ -145,6 +145,9 @@ def main(argv):
     ap.add_argument("--upstream-sha", default="",
                     help="本批次**对应的上游提交**（规格 §5 的来源说明四项之一；"
                          "#8 起由检测器传入，手动触发时为空 —— 那时来源说明如实写「未记录」）")
+    ap.add_argument("--merge-sha", default="",
+                    help="本批次构建的那个**合并提交**（#8 的检测器传入；它同时会作为 --commit）。"
+                         "⚠️ 给了就与 --commit 核：上游同步通道构建的就是那次合并")
     ap.add_argument("--run-url", default="")
     ap.add_argument("--fetch-log", default=None)
     ap.add_argument("--repro", default=(
@@ -261,6 +264,7 @@ def main(argv):
               "--repo", a.repo, "--branch", a.branch, "--commit", a.commit,
               "--run-url", a.run_url,
               "--upstream-sha", a.upstream_sha,
+              "--merge-sha", a.merge_sha,
               # ⚠️ 第四节「可复现」要写**这一批实际是怎么比的**（issue #6 起是两个独立
               #    runner）。原来不传 ⇒ 落在 make-provenance.py 的默认串上，
               #    而那句写的是「由 issue #6 负责」—— 现在这件事**已经做了**，

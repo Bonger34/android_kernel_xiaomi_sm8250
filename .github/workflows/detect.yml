@@ -39,7 +39,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "只判定、不写心跳（演练用）。⚠️ 置 true 会让本次按设计**不写心跳**"
+        description: "演练：只判定，**不写心跳、也不试合并 / 不取底包 / 不派发构建**（置 true 会让本次按设计跳过那四步）"
         required: false
         default: "false"
       upstream_repo:
@@ -108,7 +108,7 @@ jobs:
           # 写进心跳内容：它是「这一次运行」的记号，也是事后追溯的入口。
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # 定时触发时 `inputs` 是空的 ⇒ 这里拿到空串，下面按「非 true 即 false」处理。
-          DRY_RUN: ${{ inputs.dry_run }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
           set -euo pipefail
           ARGS=( --repo "$GITHUB_REPOSITORY"
@@ -204,12 +204,15 @@ jobs:
       #   ④ 派发构建 —— 用仓库自带的 `GITHUB_TOKEN`（不是 PAT），并把上游提交 / 合并基点 /
       #      合并提交 / 底包 sha256 **一起传过去**（`trigger-build.py --require` 拦空值）。
       #
-      # ⚠️ 四步都额外挂了 `inputs.dry_run != 'true'`：`dry_run` 的语义是**演练**，
-      #    而一次演练顺带触发 30 分钟 × 2 的编译 + 一次上传，不是演练该有的后果。
-      #    （定时触发时 `inputs.dry_run` 是 null ⇒ 条件成立，照常走。）
+      # ⚠️ 四步都额外挂了 `github.event.inputs.dry_run != 'true'`：`dry_run` 的语义是**演练**，
+      #    而一次演练顺带取 128 MiB 底包、传 artifact、再触发 30 分钟 × 2 的编译，
+      #    不是演练该有的后果（`dry_run` 那一条入参的说明里写清了这一点）。
+      #    ⚠️ 用 `github.event.inputs.*` 而不是 `inputs.*`：定时触发时前者是 **null**、
+      #    后者是**空串**，两种写法在这里都为真 —— 但本文件另外两处钩子已经是前者，
+      #    同一个文件里不留第二种写法（也就不必去赌 `inputs` 在某处的可用性）。
       - name: "试合并：把上游合进本线（绝不 push）"
         id: merge
-        if: steps.detect.outputs.state == 'drifted' && inputs.dry_run != 'true'
+        if: steps.detect.outputs.state == 'drifted' && github.event.inputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -250,7 +253,7 @@ jobs:
             >> "$GITHUB_STEP_SUMMARY"
 
       - name: "取底包：**整条通道只取一次**，两个 build job 共用这一份"
-        if: steps.detect.outputs.state == 'drifted' && inputs.dry_run != 'true'
+        if: steps.detect.outputs.state == 'drifted' && github.event.inputs.dry_run != 'true'
         run: |
           set -euo pipefail
           # ⚠️ 现拉**官方最新**一期（规格实现决定 4）。期次不钉死是**故意**的：
@@ -264,6 +267,11 @@ jobs:
             echo "   实际 $BSHA"; sed -n '1,20p' base-fetch.log; exit 1
           fi
           echo "  ✅ 与取底包那一步记的那一行一致"
+          # ⚠️ 期次要跟着底包一起传下去：build 那边复用这份 artifact 时会把
+          #    `base-fetch.log` **整份重写**（来源写成 `artifact:<run>/<name>`），
+          #    期次不单独传就会只剩「（未钉期次）」—— 来源说明里那条记录就没了。
+          sed -n 's/^期次[[:space:]]*//p' base-fetch.log | head -1 > base.date
+          echo "  期次（要传给构建器）= $(cat base.date)"
           # ⚠️ 这份日志要写成 `fetch-base.py` **同样的三行形状**（期次 / 来源 / 官方 sha256）——
           #    build 那边的封装链按那个形状解析（`make-provenance.py`），也是复用那条路
           #    写日志时踩过的坑（2026-09-26）。
@@ -275,7 +283,7 @@ jobs:
       # ⚠️ artifact 名里带**合并提交**：build 那边要传的就是这个名字。用 merge_sha 而不是
       #    run id，是因为「哪一份底包属于哪一次合并」得一眼看得出来。
       - uses: actions/upload-artifact@v4
-        if: steps.detect.outputs.state == 'drifted' && inputs.dry_run != 'true'
+        if: steps.detect.outputs.state == 'drifted' && github.event.inputs.dry_run != 'true'
         with:
           name: base-img-${{ steps.merge.outputs.merge_sha }}
           path: |
@@ -285,14 +293,16 @@ jobs:
           if-no-files-found: error
 
       - name: "触发构建器（仓库自带 GITHUB_TOKEN，不用 PAT）"
-        if: steps.detect.outputs.state == 'drifted' && inputs.dry_run != 'true'
+        if: steps.detect.outputs.state == 'drifted' && github.event.inputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # ★ 六个入参**一个都不能空**：空的 `merge_sha` 会让构建器按「不合并」跑，
-          #   产出一批**没有上游改动**的东西，而那次运行是**绿的** —— 最坏的一种失败。
-          #   `--require` 就是为它设的：缺一个就**一个请求都不发**（退出码 2）。
+          # ★ 七个入参**一个都不能空**：空的 `merge_sha` 会让构建器按「不合并」跑，
+          #   产出一批**没有上游改动**的东西，而那次运行是**绿的** —— 最坏的一种失败；
+          #   空的 `upstream_url` 会让构建侧重放合并时去默认的 LineageOS 仓库取那个 sha，
+          #   而上游换成别的仓库（本文件的测试钩子）时**那就取不到**。
+          #   `--require` 就是为这些设的：缺一个就**一个请求都不发**（退出码 2）。
           python3 .github/scripts/trigger-build.py \
             --repo "$GITHUB_REPOSITORY" --workflow "$BUILD_WORKFLOW" --ref "$WORK_BRANCH" \
             --input upstream_sha="${{ steps.detect.outputs.upstream_sha }}" \
@@ -301,8 +311,11 @@ jobs:
             --input base_run_id="${{ github.run_id }}" \
             --input base_artifact="base-img-${{ steps.merge.outputs.merge_sha }}" \
             --input base_sha256="$(cat base.sha256)" \
+            --input base_date="$(cat base.date)" \
+            --input upstream_url="https://github.com/${UPSTREAM_REPO}.git" \
             --require upstream_sha --require merge_sha --require merge_base \
-            --require base_run_id --require base_artifact --require base_sha256
+            --require base_run_id --require base_artifact --require base_sha256 \
+            --require upstream_url
           { echo ""; echo "### 触发构建"; echo ""
             echo "已派发 \`$BUILD_WORKFLOW\` @ \`$WORK_BRANCH\`（用仓库自带的 \`GITHUB_TOKEN\`）。"
             echo ""
@@ -314,7 +327,7 @@ jobs:
       # ⚠️ 这一条是给 #9 的地基：**全绿才推分支**。本次运行**没有**任何 push ——
       #    试合并的结果只活在这个工作区与那个 artifact 里，工作分支仍是检测器开头读到的那个提交。
       - name: "收尾复核：本次运行没有推进工作分支（#9 才做那件事）"
-        if: steps.detect.outputs.state == 'drifted' && inputs.dry_run != 'true'
+        if: steps.detect.outputs.state == 'drifted' && github.event.inputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
