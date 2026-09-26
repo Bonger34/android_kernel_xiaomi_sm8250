@@ -1,0 +1,153 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  检测器（上游同步通道 · issue #7）：**漂移发现 + 心跳**。只判定，不构建。
+#
+#  规格：`docs/los-line/upstream-sync-spec.md`（工作区文档，不在本仓库里）
+#    实现决定 1 —— 两个 workflow 职责分开：**只有本文件带 `schedule`**
+#      ⇒ 只有它会被 GitHub 的 inactivity 规则停用；构建器（build.yml）只带
+#        `workflow_dispatch`，永远点得动，是维护者永远的兜底入口。
+#    实现决定 2 —— **直接比上游**，判据是 merge-base（不是「上游 sha == 本地 sha」：
+#      我们这条跟随分支永远带着自己的提交，正常情况下也永远不等于上游 HEAD）。
+#    实现决定 3 —— 心跳：往一条**孤儿分支**写一个**带真实内容**的提交，距上次 >= 30 天才写。
+#      ⚠️ 为什么非做不可：**workflow 自己的运行不算 repository activity**
+#      ⇒ 纯 cron 的仓库 60 天后会被静默停用（实测 3 个仓库：停用前 60 天里每天 cron
+#        成功运行仍被判 `disabled_inactivity`）；而**非默认分支的 push 算** activity。
+#    实现决定 7 —— 失败标记与心跳共用**同一个**状态文件（`sync-heartbeat` 分支上的
+#      `sync-state.json`）。本工单只写 `heartbeat`；`failed` 由 #10 写。
+#
+#  ⚠️ **本工单不构建。** 检测到漂移只打印结论 —— 「试合并 → 取底包 → 触发构建」是 #8。
+#     本文件里**没有任何**构建步骤，也没有对构建器的 `workflow_dispatch` 调用
+#     （那要 `actions: write`，见下面的 permissions 注释）。
+#
+#  ⚠️ 判定逻辑**一行都不在 YAML 里**：全是 `python3 .github/scripts/detect.py`，
+#     它再调 `sync-check.py`（接缝 S3，纯决策、零 I/O、零网络，28 条离线用例）。
+#     为什么：本机**没有可用的 bash**（Windows），写在 YAML 里的步骤只能上 CI 试
+#     （一轮十几分钟）；写成脚本后同一条链在本机就能跑通 —— 而本机有真上游可对。
+#     同 `package.py`（issue #5）的理由。
+# ══════════════════════════════════════════════════════════════════════════════
+name: Detect upstream drift (heartbeat + drift)
+
+on:
+  schedule:
+    # 每天一次（UTC）。⚠️ 分钟取 **17** 而不是 0：GitHub 的定时队列在整点最挤
+    # （官方文档明说高负载时会延迟甚至丢弃）。这条通道的价值是「每天都跑」，
+    # 晚十几分钟毫无影响；被挤掉一次才是真损失。
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只判定、不写心跳（演练用）。⚠️ 置 true 会让本次按设计**不写心跳**"
+        required: false
+        default: "false"
+
+# ⚠️ **一旦写了 `permissions:`，没列出的权限一律变 `none`。**
+#    `contents: write` 是写心跳分支要的（`contents: read` 已经含在里面，checkout 也要它）。
+#    #8 起检测器还要用 `GITHUB_TOKEN` 触发构建器 ⇒ 那时再加 `actions: write`
+#    （缺了就是 403 `Resource not accessible by integration`，规格实现决定 1 的原话）。
+permissions:
+  contents: write
+
+# 一天一次 + 随时可能手动触发：两次同时跑会撞同一份状态文件。CAS 会让后者响亮地 409
+# （不会互相覆盖，这一点是好的），但那是一次没必要的红。排队等一下比丢掉一次好。
+concurrency:
+  group: sync-detect
+  cancel-in-progress: false
+
+env:
+  # 本线的**跟随分支**（= 本仓库默认分支）。上游同步的一切都对着它。
+  # ⚠️ 「加一条分支 = 改一个变量」的落点就是这三行（规格实现决定 9 / 用户故事 31）。
+  WORK_BRANCH: ksu-lineage-23.2
+  UPSTREAM_REPO: LineageOS/android_kernel_xiaomi_sm8250
+  UPSTREAM_BRANCH: lineage-23.2
+  # 心跳分支：**孤儿分支**，与任何工作分支没有共同历史（用户故事 23：
+  # 「不碰任何工作分支 ⇒ 不会移动分支头、不影响构建时间戳、不和自动合并抢分支」）。
+  HEARTBEAT_BRANCH: sync-heartbeat
+
+jobs:
+  detect:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      # ⚠️ `ref:` 显式钉住工作分支：本工作流可以被手动派发到**任何** ref 上
+      #    （「检测器被停用时恢复只要点几下」那条验收），而我们要跑的永远是跟随分支上那份
+      #    检测器 —— 否则手动选错 ref 会跑出一份别处的脚本，而且没人看得出来。
+      # `fetch-depth: 1` 够了：本步骤只用仓库里的脚本，不做任何 git 历史运算
+      #（merge-base 走 API 取，理由见 detect.py 的文件头）。
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.WORK_BRANCH }}
+          fetch-depth: 1
+
+      - name: "检测：漂移发现 + 心跳（只判定，不构建）"
+        id: detect
+        env:
+          # ⚠️ 用仓库自带的 `GITHUB_TOKEN`，**不用 PAT** —— 这条通道不该有任何长期凭据
+          #    （规格用户故事 32）。
+          GH_TOKEN: ${{ github.token }}
+          # 写进心跳内容：它是「这一次运行」的记号，也是事后追溯的入口。
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # 定时触发时 `inputs` 是空的 ⇒ 这里拿到空串，下面按「非 true 即 false」处理。
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          ARGS=( --repo "$GITHUB_REPOSITORY"
+                 --branch "$WORK_BRANCH"
+                 --upstream-repo "$UPSTREAM_REPO"
+                 --upstream-branch "$UPSTREAM_BRANCH"
+                 --heartbeat-branch "$HEARTBEAT_BRANCH"
+                 --run-url "$RUN_URL"
+                 --summary "$GITHUB_STEP_SUMMARY"
+                 --github-output "$GITHUB_OUTPUT"
+                 --json-out detect.json )
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "⚠️ dry-run：只判定，不写心跳（心跳仍会报「到期」）"
+            ARGS+=(--dry-run)
+          fi
+
+          # ⚠️ 退出码**有语义**：0/10/20/30 是 S3 的四选一结论，**四个都是正常结论**。
+          #    写成「非零即报错」的话，一次正常的「有漂移」会被当成工具崩了 ——
+          #    而这条通道最常见的正常状态恰恰就是「有漂移」。
+          set +e
+          python3 .github/scripts/detect.py "${ARGS[@]}"
+          RC=$?
+          set -e
+
+          case "$RC" in
+            0|10|20|30) echo "✅ 检测完成：退出码 $RC" ;;
+            *)
+              echo "❌ 检测器本身失败（退出码 $RC）：1 = 运行错误，2 = 用法错误"
+              echo "   四个正常结论是 0（无漂移）/ 10（有漂移）/ 20（已拉黑）/ 30（该写心跳了）。"
+              exit "$RC"
+              ;;
+          esac
+          echo "──────── 机器可读的结果（detect.json）────────"
+          if [ -f detect.json ]; then cat detect.json
+          else echo "（没有 detect.json —— 检测器没走到写它的那一步）"; fi
+          echo "───────────────────────────────────────────────"
+          if [ "$RC" = "10" ]; then
+            echo "::notice::检测到上游漂移 —— 本工单只发现、不构建（触发构建是 issue #8）"
+          fi
+
+      # ⚠️ 这一节是给 #8 的**接口 + 一次真检查**：`state` / `upstream_sha` / `merge_base`
+      #    正是 #8「试合并 → 取底包 → 触发构建」要往下传的三个值。
+      #    但它不只是打印 —— `--github-output` 那条路一旦坏掉，这里会**当场红**，
+      #    而不是等到 #8 拿着一个空值去试合并（那时报的是另一件事，查起来贵得多）。
+      - name: "检查结果确实传了出来（#8 要接的就是这几个值）"
+        run: |
+          set -euo pipefail
+          STATE="${{ steps.detect.outputs.state }}"
+          UP="${{ steps.detect.outputs.upstream_sha }}"
+          LO="${{ steps.detect.outputs.local_sha }}"
+          if [ -z "$STATE" ]; then
+            echo "❌ 没拿到 state —— detect.py 的 --github-output 没写成功"
+            exit 1
+          fi
+          if [ -z "$UP" ] || [ -z "$LO" ]; then
+            echo "❌ 没拿到 sha：upstream='$UP' local='$LO'"
+            exit 1
+          fi
+          echo "state      = $STATE（退出码 ${{ steps.detect.outputs.exit_code }}）"
+          echo "upstream   = $UP"
+          echo "local      = $LO"
+          echo "merge_base = ${{ steps.detect.outputs.merge_base }}"
+          echo "心跳       = 到期 ${{ steps.detect.outputs.heartbeat_due }} / 已写 ${{ steps.detect.outputs.heartbeat_written }}"
+          echo "（本工单到此为止：无漂移、有漂移都不构建 —— 那是 #8）"
