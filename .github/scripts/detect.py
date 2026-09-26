@@ -722,7 +722,7 @@ def self_test(tmpdir):
         """跑一次 `run()`。`want = (结论, 退出码, 是否写心跳)`；`None` = 只跑不断言四元组。"""
         n[0] += 1
         api_kw = {"merge_base": kw.pop("merge_base", MB_SAME)}
-        for k in ("branch_sha", "state", "upstream_subject", "tree_paths", "moved_sha"):
+        for k in ("branch_sha", "state", "upstream_subject", "tree_paths", "refs_extra"):
             if k in kw:
                 api_kw[k] = kw.pop(k)
         api = FakeApi(UP, LO, **api_kw)
