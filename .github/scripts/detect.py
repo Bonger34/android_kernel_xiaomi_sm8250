@@ -33,16 +33,23 @@
 
 ## 两条不变量
 
-**① 只往心跳分支写，绝不碰工作分支。**
-三层，一层比一层硬：`--heartbeat-branch` 与 `--branch` 相同、或落在 `ksu-` / `lineage-`
-这两个命名空间里（那是**工作分支**与**上游镜像分支**的名字）⇒ **联网之前就拒绝**；
-写完之后**再读一次工作分支 HEAD**，与运行开始时读到的不一样就报错；
-自测里还有一条断言：整个自测过程中被写过的 ref **只有** `refs/heads/<心跳分支>`。
+**① 只往心跳分支写，绝不碰工作分支 —— 而「工作分支」是**全部**分支，不只是 `--branch`。**
+三层，一层比一层硬：
+
+1. **联网之前**的名守卫：`--heartbeat-branch` 与 `--branch` 相同、带 `refs/` 前缀、含空白或 `..`、
+   或落在 `ksu-` / `lineage-` 这两个命名空间里（那是**工作分支**与**上游镜像分支**的名字）
+   ⇒ **拒绝运行**（`assert_heartbeat_branch()`）。
+2. **写之前与写之后各取一次「全部 ref」的快照**（`GET /git/refs/heads`），
+   断言**唯一**变动的 ref 就是心跳分支（`verify()`）。⚠️ 这一条才真正对得上验收的原话
+   「不向**任何**工作分支写入」—— 只盯 `--branch` 一条的话，写别的分支不会触发任何断言。
+   ⚠️ 快照满一页（100 条）时**拒绝给结论**而不是「没看见就当没发生」（同类：坑表 #32 的
+   「不完整的绿比红更坏」）。
+3. 自测里断言「整个过程写过的 ref 只有 `refs/heads/<心跳分支>`」。
 
 **② 心跳提交必须带真实内容，且落在一条真正的孤儿分支上。**
 「内容确有变化」是**结构性**的，不靠检查：写心跳的前提是旧的 `heartbeat.at` 至少 **30 天**前，
 而新内容的 `at` 是今天 ⇒ 两个字段必然不同。内容里另带 `at_utc`（秒级）与 `run`（本次运行的 URL），
-那是给**事后追溯**用的（哪一次运行写的心跳），顺带让同一天里写两次也不会是同一条内容。
+那是给**事后追溯**用的（哪一次运行写的心跳）。
 「孤儿」则有**写后复核**：读心跳分支的顶层树，必须是「只有状态文件」——
 从工作分支切出来的分支顶层是 `Makefile` / `arch` / `drivers`…，一眼可辨。
 
@@ -68,9 +75,14 @@
 
 检测器只写**一个文件**，且**必须**写在一条与工作分支无共同历史的**孤儿分支**上。
 Git Data API 表达这件事比 git 更直接：`parents: []` 就是孤儿提交（`git checkout --orphan`
-要先清索引、再提防把工作树带过去）。附带两个好处：状态文件的读改写天然是 **CAS**
-（Contents API 要 `sha`）⇒ 与 #10 的失败标记并发写会**响亮地 409**，而不是互相覆盖；
-以及整个工具在 Windows 本机也能跑（本项目没有可用的 bash，见 `PROJECT.md` §6.5）。
+要先清索引、再提防把工作树带过去）。附带的好处是**三处写路径里有两处天然是 CAS**：
+改文件要 `sha`、**建**文件不能给 `sha`（文件已存在时不给 `sha` 会被 GitHub 以 422 拒掉）
+⇒ 与 #10 的失败标记并发写会**响亮地失败**，而不是互相覆盖。只有「**建孤儿分支**」那一步
+没有 CAS，而它的语义本来就是「建一个还不存在的 ref」—— 并发时后者照样 422。
+（第一条写路径里，这一点是 code-review 抓出来的：原来那张表还有第三条
+「分支在、文件不在 ⇒ PATCH ref」，而 `PATCH ref` **不校验 fast-forward、可覆盖**。
+改成走 Contents API 的「建文件」形态之后，那条路一起没了。）
+整个工具在 Windows 本机也能跑（本项目没有可用的 bash，见 `PROJECT.md` §6.5）。
 
 ## 用法
 
@@ -79,12 +91,16 @@ Git Data API 表达这件事比 git 更直接：`parents: []` 就是孤儿提交
 python tools/detect.py --repo Bonger34/android_kernel_xiaomi_sm8250 \
     --branch ksu-lineage-23.2 --dry-run
 
+# 「那一天会怎么写」——用 --today 把时钟拨到未来，拿真数据验 30 天边界
+python tools/detect.py --repo Bonger34/android_kernel_xiaomi_sm8250 \
+    --branch ksu-lineage-23.2 --today 2026-10-27 --dry-run
+
 # CI：写心跳（凭据从 GH_TOKEN / GITHUB_TOKEN 环境变量来）
 python .github/scripts/detect.py --repo "$GITHUB_REPOSITORY" --branch ksu-lineage-23.2 \
     --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
     --summary "$GITHUB_STEP_SUMMARY" --github-output "$GITHUB_OUTPUT"
 
-python tools/detect.py --self-test       # 离线，假 API，16 条断言（不联网）
+python tools/detect.py --self-test       # 离线，假 API，17 条断言（不联网）
 ```
 
 ⚠️ **本文件有两份，必须逐字节相同**：工作区 `tools/detect.py` 与 LOS 工作仓库里的
@@ -112,6 +128,7 @@ API_DEFAULT = "https://api.github.com"
 UA = "umi-loskernel-detect/1"
 TIMEOUT = 60
 TRIES = 3
+REFS_PAGE = 100                 # 取全部分支 ref 时一页要多少条（满页即拒绝给结论，见 list_refs）
 
 EXIT_RUN_ERROR = 1
 EXIT_USAGE = 2
@@ -177,12 +194,10 @@ class Api:
     **任何脚本都不得硬编码 PAT**。读接口是公开的，所以 `--dry-run` 下没有凭据也能跑。
     """
 
-    def __init__(self, base=API_DEFAULT, token=None, timeout=TIMEOUT, tries=TRIES):
-        self.base = base.rstrip("/")
+    def __init__(self, token=None, timeout=TIMEOUT, tries=TRIES):
         self.token = token
         self.timeout = timeout
         self.tries = tries
-        self.calls = []                 # 自测会读它 —— 「到底碰了哪些端点」要有据可查
 
     def call(self, method, path, payload=None, allow_404=False):
         """返回解析后的 JSON；`allow_404` 时返回 `None`（**「明确说没有」是正常状态**：
@@ -190,7 +205,6 @@ class Api:
         last = None
         for i in range(self.tries):
             try:
-                self.calls.append("%s %s" % (method, path.split("?")[0]))
                 return self._one(method, path, payload, allow_404)
             except ApiError as e:
                 if not e.retryable:
@@ -201,7 +215,7 @@ class Api:
         raise last
 
     def _one(self, method, path, payload, allow_404):
-        url = "%s/%s" % (self.base, path.lstrip("/"))
+        url = "%s/%s" % (API_DEFAULT, path.lstrip("/"))
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url, data=data, method=method,
@@ -275,10 +289,29 @@ def state_text(doc):
     return json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
-def check_branch_guard(working, heartbeat):
-    """不变量 ① 的落地：**心跳分支不许是工作分支**（也不许落进那两个命名空间）。"""
-    if not heartbeat or heartbeat.strip() != heartbeat or " " in heartbeat:
-        raise UsageError("--heartbeat-branch 不合法：%r" % heartbeat)
+def assert_heartbeat_branch(working, heartbeat):
+    """不变量 ① 的第一层：**心跳分支不许是工作分支**（也不许落进那两个命名空间）。
+
+    名字叫 `assert_…` 而不是 `check_…`：它**只抛异常、不返回布尔值** ——
+    叫 `check_` 会让人以为有个返回值可看，而漏掉「没抛就等于没发生过」。
+
+    ⚠️ `refs/` 前缀、空白、`..` 一律拒绝：`write_state` 会拿这个名字去拼
+    `"refs/heads/" + branch`，于是 `refs/heads/ksu-lineage-23.2` 这种输入
+    **既能绕过相等判定、又不会被前缀规则挡住**（它不以 `ksu-` 开头），
+    最后建出一个叫 `refs/heads/refs/heads/…` 的新分支 —— 这不是「写到了工作分支」，
+    但它说明**守卫本身是漏的**，而守卫漏了这件事比它这次挡住了什么更重要。
+    """
+    bad = []
+    if not heartbeat or heartbeat.strip() != heartbeat:
+        bad.append("为空或带首尾空白")
+    if any(c in heartbeat for c in " \t\n\\"):
+        bad.append("含空白或反斜杠")
+    if heartbeat.startswith("/") or heartbeat.endswith("/"):
+        bad.append("以斜杠开头或结尾")
+    if ".." in heartbeat or heartbeat.startswith("refs/"):
+        bad.append("含 `..` 或以 `refs/` 开头")
+    if bad:
+        raise UsageError("--heartbeat-branch 不合法（%s）：%r" % ("；".join(bad), heartbeat))
     if heartbeat == working:
         raise UsageError("心跳分支不能等于工作分支（%s）—— 心跳是**孤儿分支**，"
                          "绝不向工作分支写入是这条通道的硬约束" % working)
@@ -288,38 +321,67 @@ def check_branch_guard(working, heartbeat):
                                                   HEARTBEAT_BRANCH))
 
 
+def assert_state_path(path):
+    """状态文件的路径也会被拼进 API 路径 ⇒ 同样要有形状守卫。
+
+    ⚠️ 只挡「一眼就不对」的形状（空、绝对路径、`..`、反斜杠）：它是**配置**，
+    不是外部输入 —— 这里的目标是让写歪的配置**当场失败**，而不是防御攻击者。
+    """
+    if (not path or path.startswith("/") or ".." in path or "\\" in path
+            or path.startswith("refs/") or path.strip() != path):
+        raise UsageError("--state-path 不合法（不能为空 / 绝对路径 / 含 `..` 或反斜杠）：%r" % path)
+
+
+def list_refs(api, repo):
+    """全部**分支** ref 的快照：`{"refs/heads/x": "<sha>"}`。
+
+    ⚠️ 满一页时**拒绝给结论**：只看见 100 条就宣布「没有别的分支被动过」是
+    典型的「不完整的绿」（坑表 #32）。宁可在这里响亮地失败，也不要给出一个
+    范围不明的结论 —— 分页该由**用到它的那一天**去实现，而不是今天悄悄放过。
+    """
+    refs = api.call("GET", "repos/%s/git/refs/heads?per_page=%d" % (repo, REFS_PAGE))
+    if len(refs) >= REFS_PAGE:
+        raise RuntimeError(
+            "分支数达到一页上限（%d）—— 「没有任何别的 ref 被动过」这条**给不出结论**。\n"
+            "    （只看得见一页就说「没看见」＝ 一次不完整的绿，见 PROJECT.md §7 坑表 #32。）\n"
+            "    要么给这条路径补上分页，要么换一个不依赖全量 ref 的判据。" % REFS_PAGE)
+    return {r["ref"]: r["object"]["sha"] for r in refs}
+
+
 def write_state(api, repo, branch, path, text, file_sha, branch_sha):
-    """把状态文件写到心跳分支上。返回这次走的是哪条路（`contents` / `orphan` / `commit`）。
+    """把状态文件写到心跳分支上。返回这次走的是哪条路。
 
-    三条路各自对应一种真实状态，**不是三个分支的同义反复**：
+    三条真实状态 ⇒ 两条代码路径（第三条是 code-review 之后并进来的，见下）：
 
-    | 情形 | 走法 |
-    |---|---|
-    | 分支在、文件也在 | Contents API：`sha` 就是 **CAS** —— 并发写会 409，而不是互相覆盖 |
-    | 分支不在（首次运行） | blob → tree（**无 `base_tree`**）→ commit（**`parents: []`**）→ 建 ref ⇒ **孤儿提交** |
-    | 分支在、文件不在 | 同上，但带 `base_tree` 与父提交，再 `PATCH` ref |
+    | 情形 | 走法 | 并发时 |
+    |---|---|---|
+    | 分支在、文件也在 | Contents API + `sha`（**改**） | 409 —— 响亮 |
+    | 分支在、文件不在 | Contents API **不带 `sha`**（**建**） | 422 —— 响亮 |
+    | 分支不在（首次运行） | blob → tree（无 `base_tree`）→ commit（**`parents: []`**）→ 建 ref ⇒ **孤儿提交** | 422「Reference already exists」—— 响亮 |
 
-    ⚠️ 第三条不是假想：状态文件被手工删掉、或将来 #10 换了文件名，都会落到它上面。
-    只写前两条的实现会在那里撞一个 422「Reference already exists」—— 一句与实际原因无关的报错。
+    ⚠️ 第二行原来走的是「blob → tree（带 `base_tree`）→ commit（有父）→ **PATCH ref**」，
+    而 `PATCH /git/refs` **不校验 fast-forward**：并发时后写的那次会**盖掉**前一次的状态文件。
+    换成 Contents API 的「建文件」形态之后，**三处里有两处是天然 CAS**，
+    剩下的一处（建孤儿分支）并发时也是响亮失败 —— 这与规格「决定 10 并发与幂等」想要的
+    「不互相覆盖」一致。
     """
     if file_sha:
         api.call("PUT", "repos/%s/contents/%s" % (repo, qp(path)),
                  {"message": HEARTBEAT_MSG % _date_of(text), "content": _b64(text),
                   "sha": file_sha, "branch": branch})
         return "contents"
+    if branch_sha:
+        # ⚠️ **不给 `sha`**：给了会被当作「改一个不存在的文件」，不给才是「建」。
+        #    若另一轮抢先建出来了，这次会 422 —— 那是我们要的失败方向。
+        api.call("PUT", "repos/%s/contents/%s" % (repo, qp(path)),
+                 {"message": HEARTBEAT_MSG % _date_of(text), "content": _b64(text),
+                  "branch": branch})
+        return "create"
     blob = api.call("POST", "repos/%s/git/blobs" % repo, {"content": text, "encoding": "utf-8"})
     tree = {"tree": [{"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]}]}
-    if branch_sha:
-        base = api.call("GET", "repos/%s/git/commits/%s" % (repo, branch_sha))
-        tree["base_tree"] = base["tree"]["sha"]
     t = api.call("POST", "repos/%s/git/trees" % repo, tree)
     c = api.call("POST", "repos/%s/git/commits" % repo,
-                 {"message": HEARTBEAT_MSG % _date_of(text), "tree": t["sha"],
-                  "parents": [branch_sha] if branch_sha else []})
-    if branch_sha:
-        api.call("PATCH", "repos/%s/git/refs/heads/%s" % (repo, qs(branch)),
-                 {"sha": c["sha"], "force": False})
-        return "commit"
+                 {"message": HEARTBEAT_MSG % _date_of(text), "tree": t["sha"], "parents": []})
     api.call("POST", "repos/%s/git/refs" % repo,
              {"ref": "refs/heads/" + branch, "sha": c["sha"]})
     return "orphan"
@@ -329,25 +391,32 @@ def _b64(text):
     return base64.b64encode(text.encode("utf-8")).decode("ascii")
 
 
-def verify(a, api, local_sha, log):
+def verify(a, api, refs_before, log):
     """写完之后的两条复核。**两条都能真的失败** —— 它们是回归闸，不是仪式。
 
     一次心跳（约 30 天一次）多两次 API 调用，换来两条验收从此**每次运行都被查一遍**：
 
     | 查什么 | 怎么查 | 失败说明什么 |
     |---|---|---|
-    | 工作分支没被动过 | 再读一次它的 HEAD，与运行开始时读到的比 | 有东西写了它 —— 而「不向任何工作分支写入」是这条通道的硬约束 |
+    | **没有任何别的 ref 被动过** | 写前写后各取一次全部分支 ref 的快照，逐条比 | 有东西写了别的分支 —— 而验收的原话是「不向**任何**工作分支写入」 |
     | 心跳分支是**孤儿**分支 | 读它的**顶层树**，看是不是只有状态文件 | 它多半是从工作分支上切出来的 —— 那种分支带着整棵内核树，也就不再是「不碰工作分支」 |
+
+    ⚠️ 第一条**必须比全部 ref，不是只比 `--branch`**：只盯一条分支的话，
+    写 `main`、写别的 `ksu-*` 都不会触发任何断言，而验收问的是「任何工作分支」。
+    （这样也就顺带覆盖了原来那条「`--branch` 的 HEAD 没动」，且范围更宽。）
 
     ⚠️ 第二条为什么不用「走一遍父提交看有没有共同的根」：那是 N 次调用，而**孤儿分支的顶层
     只有一个文件**是它的充分特征（从工作分支切出来的分支顶层是 `Makefile` / `arch` / `drivers`…）。
     """
-    got = api.call("GET", "repos/%s/commits/%s" % (a.repo, qs(a.branch)))["sha"]
-    if got != local_sha:
+    refs_after = list_refs(api, a.repo)
+    moved = sorted(ref for ref in set(refs_before) | set(refs_after)
+                   if refs_before.get(ref) != refs_after.get(ref))
+    want = ["refs/heads/" + a.heartbeat_branch]
+    if moved != want:
         raise RuntimeError(
-            "工作分支 %s 被动过了：运行开始时是 %s，现在是 %s。\n"
-            "    检测器只许写 %s —— 见文件头的不变量 ①。"
-            % (a.branch, local_sha[:12], got[:12], a.heartbeat_branch))
+            "这次运行动过的 ref 不只是心跳分支：实际 %s，应为 %s。\n"
+            "    「不向**任何**工作分支写入」是这条通道的硬约束（见文件头的不变量 ①）。"
+            % (moved or "（一个都没动）", want))
     tree = api.call("GET", "repos/%s/git/trees/%s" % (a.repo, qs(a.heartbeat_branch)))
     names = sorted(e.get("path") for e in (tree.get("tree") or []))
     if names != [a.state_path]:
@@ -355,8 +424,8 @@ def verify(a, api, local_sha, log):
             "心跳分支 %s 的顶层不是「只有 %s」，而是 %s（共 %d 项）。\n"
             "    它多半是从工作分支上切出来的 —— 那样它带着整棵内核树，就不再是**孤儿**分支了。"
             % (a.heartbeat_branch, a.state_path, names[:6], len(names)))
-    log("✅ 复核：工作分支一个字节没动（%s）；心跳分支是孤儿（顶层只有 %s）"
-        % (local_sha[:12], a.state_path))
+    log("✅ 复核：全部 %d 个分支里**只有** %s 动过；心跳分支是孤儿（顶层只有 %s）"
+        % (len(refs_after), want[0], a.state_path))
 
 
 def _date_of(text):
@@ -369,13 +438,18 @@ def _date_of(text):
 
 def run(a, api, log=print, now_utc=None):
     """一次检测。返回结果字典（它同时是 `--json-out` 的内容与 `--github-output` 的来源）。"""
-    check_branch_guard(a.branch, a.heartbeat_branch)
+    assert_heartbeat_branch(a.branch, a.heartbeat_branch)
+    assert_state_path(a.state_path)
     sc = _load_sibling("sc", "sync-check.py")
+    # ⚠️ 时刻只算**一次**：心跳内容里的 `at_utc` 与结果字典里的 `now_utc` 必须是同一个值，
+    #    否则跨秒边界时两处对不上（`_date_of` 的注释警告的正是同一件事：不要算两遍「今天」）。
+    now = now_utc or _utc_now()
 
     # ── ① 三个 sha。判据是 **merge-base**，不是「上游 sha == 本地 sha」──────────────
     # 我们的跟随分支**永远**带着自己的提交（KSU 集成 + CI + 修复），所以它在正常情况下
     # 也永远不等于上游 HEAD。「有没有漂移」问的是「上游那个 HEAD 在不在我们的历史里」。
-    up_ref = a.upstream_sha or a.upstream_branch
+    # ⚠️ `--upstream-branch` 也可以直接给一个 **sha** —— `commits/{ref}` 这个接口两样都收。
+    up_ref = a.upstream_branch
     up = api.call("GET", "repos/%s/commits/%s" % (a.upstream_repo, qs(up_ref)))
     lo = api.call("GET", "repos/%s/commits/%s" % (a.repo, qs(a.branch)))
     cmp = api.call("GET", "repos/%s/compare/%s...%s" % (a.repo, up["sha"], lo["sha"]))
@@ -422,9 +496,9 @@ def run(a, api, log=print, now_utc=None):
     if not oc.heartbeat_due:
         note = "心跳未到期（%s 天前）" % oc.heartbeat_age_days
     elif a.dry_run:
-        skip = "--dry-run：只报「该写了」，不写"
+        skip = "--dry-run（只报「该写了」，不写）"
     else:
-        hb = new_state(old_text, today.isoformat(), now_utc or _utc_now(), up["sha"], a.run_url)
+        hb = new_state(old_text, today.isoformat(), now, up["sha"], a.run_url)
         note = hb.note
         new_text = state_text(hb.doc)
         # 「内容确有变化」这条验收**不需要**再查一遍，它是结构性的：写心跳的前提是旧的
@@ -432,11 +506,16 @@ def run(a, api, log=print, now_utc=None):
         # （第一版这里写了一句 `if new_text == old_text: raise` —— 那**到不了**，
         #   一条永远不会响的检查只会给假的安全感。真要防的是「哪天窗口被改小」，
         #   而那件事在 `sync-check.py` 的 `--heartbeat-days >= 1` 那行上。）
+        #
+        # ⚠️ 写之前先取一次**全部 ref** 的快照 —— 写完之后要比它。
+        #    不变量 ① 问的是「**任何**工作分支有没有被动过」，所以快照必须是全部，
+        #    不能只盯 `--branch` 那一条：那样写别的分支不会触发任何断言。
+        refs_before = list_refs(api, a.repo)
         how = write_state(api, a.repo, a.heartbeat_branch, a.state_path, new_text,
                           file_sha, branch_sha)
         written = True
         log("✅ 心跳已写入 %s（%s）：%s" % (a.heartbeat_branch, how, note))
-        verify(a, api, lo["sha"], log)
+        verify(a, api, refs_before, log)
 
     log("")
     for line in sc.render(oc, subject).split("\n"):
@@ -464,7 +543,7 @@ def run(a, api, log=print, now_utc=None):
         "heartbeat_how": how, "heartbeat_skip": skip, "heartbeat_note": note,
         "heartbeat_age_days": oc.heartbeat_age_days,
         "dry_run": bool(a.dry_run), "today": today.isoformat(),
-        "run_url": a.run_url, "now_utc": now_utc or _utc_now(),
+        "run_url": a.run_url, "now_utc": now,
     }
 
 
@@ -497,6 +576,15 @@ def render_summary(r):
     elif r["state"] == "blacklisted":
         L += ["### 该上游提交已试过且失败 —— 今天不做", "",
               "标记 7 天后自动过期（规格实现决定 7），过期后会自动重试。", ""]
+    if r["heartbeat_skip"]:
+        # ⚠️ 这条必须说清，否则「排障期反复手动跑 dry-run」会被误当成「心跳还在走」：
+        #    规格已实测的事实是「**workflow 自己的运行不算 repository activity**，
+        #    **push 才算**」⇒ dry-run 跑一百次也刷新不了那个 60 天的计时器。
+        L += ["### ⚠️ 本次**没有** push —— 活动的计时器没有被刷新", "",
+              "心跳到期了却没写：%s。" % r["heartbeat_skip"],
+              "而「workflow 自己的运行**不算** repository activity，**push 才算**」是规格实测过的",
+              "⇒ 排障期反复手动触发检测器，**不能**代替心跳。要刷计时器就得让 `dry_run=false` 跑一次。",
+              ""]
     return "\n".join(L) + "\n"
 
 
@@ -518,29 +606,35 @@ class FakeApi:
     """假 API：**只认实现真正用到的那些端点**，其余一律抛错。
 
     「多调了一个端点」本身就是实现跑偏的信号，所以这里不给兜底 —— 让它当场炸。
-    另记 `refs_written`：不变量 ①（只写心跳分支）在自测里是一条**断言**，不是注释。
+    记下 `refs_written` 与 `puts`：不变量 ①（只写心跳分支）与「建文件不带 `sha`」
+    在自测里是**断言**，不是注释。
     """
 
     def __init__(self, upstream_sha, local_sha, merge_base, branch_sha=None, state=None,
                  upstream_subject="camera: fix something", repo="o/r",
                  upstream_repo="LineageOS/android_kernel_xiaomi_sm8250",
-                 tree_paths=None, moved_sha=None):
+                 tree_paths=None, refs_extra=None, write_touches=None):
         self.up_sh, self.lo_sh, self.mb = upstream_sha, local_sha, merge_base
         self.branch_sha, self.state = branch_sha, state
         self.subject = upstream_subject
         self.repo, self.upstream_repo = repo, upstream_repo
         self.tree_paths = tree_paths if tree_paths is not None else [STATE_PATH]
-        self.moved_sha = moved_sha        # 非 None ⇒ 第二次读工作分支 HEAD 时返回它（模拟被别人推了）
-        self.local_reads = 0
-        self.calls, self.refs_written = [], []
-        self.blob_n = 0
+        # 写之后**额外**变化的 ref（负向用例用：模拟「别的分支也被推了」）
+        self.refs_extra = refs_extra if refs_extra is not None else {}
+        self.refs_written, self.puts, self.calls = [], [], []
+        self.blob_n, self.wrote = 0, False
 
     def call(self, method, path, payload=None, allow_404=False):
         self.calls.append("%s %s" % (method, path.split("?")[0]))
         p = path.split("?")[0]
         if method == "GET":
-            if "/git/commits/" in p:                       # 取某个提交的 tree（第三条写路径用）
-                return {"tree": {"sha": "tree-base"}}
+            if "/git/refs/heads" in p:                     # 写前/写后的**全部**分支快照
+                d = {"refs/heads/ksu-lineage-23.2": self.lo_sh,
+                     "refs/heads/lineage-23.2": self.up_sh}
+                if self.wrote:
+                    d["refs/heads/" + HEARTBEAT_BRANCH] = "commit-new"
+                    d.update(self.refs_extra)
+                return [{"ref": k, "object": {"sha": v}} for k, v in d.items()]
             if "/git/trees/" in p:                         # 写后复核：心跳分支的**顶层**树
                 return {"tree": [{"path": x, "type": "blob"} for x in self.tree_paths]}
             # ⚠️ 按**仓库**分辨两个 `commits/<ref>`：上游那个传的是**分支名**而不是 sha，
@@ -548,9 +642,6 @@ class FakeApi:
             if "/commits/" in p and not p.startswith("repos/%s/commits/" % self.repo):
                 return {"sha": self.up_sh, "commit": {"message": self.subject + "\n\nbody"}}
             if "/commits/" in p:                           # 本地 HEAD（按分支名取）
-                self.local_reads += 1
-                if self.moved_sha and self.local_reads > 1:
-                    return {"sha": self.moved_sha}
                 return {"sha": self.lo_sh}
             if "/compare/" in p:
                 return {"merge_base_commit": {"sha": self.mb}, "behind_by": 0, "ahead_by": 7}
@@ -567,7 +658,9 @@ class FakeApi:
                     return None
                 return {"sha": "blob-sha-old", "content": _b64(self.state)}
         if method == "PUT" and "/contents/" in p:
+            self.puts.append(payload)
             self.refs_written.append(payload["branch"])
+            self.wrote = True
             return {"content": {"sha": "new"}}
         if method == "POST" and p.endswith("/git/blobs"):
             self.blob_n += 1
@@ -578,11 +671,9 @@ class FakeApi:
             return {"sha": "commit-new"}
         if method == "POST" and p.endswith("/git/refs"):
             self.refs_written.append(payload["ref"].split("/")[-1])
+            self.wrote = True
             return {"ref": payload["ref"]}
-        if method == "PATCH" and "/git/refs/heads/" in p:
-            self.refs_written.append(p.split("/git/refs/heads/")[-1])
-            return {"object": {"sha": payload["sha"]}}
-        raise AssertionError("假 API 不认识这个端点：%s %s" % (method, path))
+        raise AssertionError("假 API 不认识这个端点：%s %s（实现跑偏了？）" % (method, path))
 
 
 UP = "a" * 40          # 上游 HEAD
@@ -597,7 +688,7 @@ NOW = "2026-09-26T12:00:00Z"
 def _args(**kw):
     base = dict(repo="o/r", branch=WORK,
                 upstream_repo="LineageOS/android_kernel_xiaomi_sm8250",
-                upstream_branch="lineage-23.2", upstream_sha=None,
+                upstream_branch="lineage-23.2",
                 heartbeat_branch=HEARTBEAT_BRANCH, state_path=STATE_PATH,
                 work_dir=tempfile.gettempdir(), run_url="https://example/run/1",
                 today=TODAY, dry_run=False)
@@ -610,7 +701,7 @@ def _quiet(*_a, **_kw):
 
 
 def self_test(tmpdir):
-    """11 条用例。返回失败条数。
+    """17 条断言。返回失败条数。
 
     **测的是编排，不是判定**（判定由 `sync-check.py --self-test` 的 28 条负责）。
     每条都断言四件事：结论 / 退出码 / 心跳写不写 / **写过的 ref 是不是只有心跳分支**。
@@ -710,38 +801,36 @@ def self_test(tmpdir):
     else:
         print("  ✅ #%-2d %-46s -> 自愈：%s" % (n[0], "⑦ `failed` 写坏 ⇒ 丢弃并说明", hb7.note[:30]))
 
-    # ⑧ 分支在、**文件不在** ⇒ 第三条写路径：带 `base_tree` 与父提交，然后 **PATCH ref**
-    #    （而不是去建一个已经存在的 ref —— 那会撞 422，报一句与实际原因无关的错）。
+    # ⑧ 分支在、**文件不在** ⇒ 走 Contents API 的**建文件**形态（不带 `sha`）。
     #    这条不是假想：状态文件被手工删掉、或将来 #10 换了文件名，都会落到它上面。
-    r8, api8 = case("⑧ 分支在但状态文件不在 ⇒ PATCH ref，不建 ref", ("drifted", 10, True),
+    #    ⚠️ 第一版这里写的是「带 base_tree 与父提交、再 **PATCH ref**」——
+    #    code-review 指出 `PATCH /git/refs` **不校验 fast-forward**，并发时会盖掉别人的状态
+    #    ⇒ 改走 Contents API 之后，三条写路径里两处是天然 CAS（改要 sha、建不能给 sha），
+    #    剩下的一处（建孤儿分支）并发时也是响亮失败。
+    r8, api8 = case("⑧ 分支在但状态文件不在 ⇒ 建文件（**不带 sha**）", ("drifted", 10, True),
                     merge_base=MB_OLD, branch_sha="c0mmit", state=None)
     n[0] += 1
     if r8 is None:
         pass
-    elif (r8["heartbeat_how"] == "commit"
-          and "PATCH repos/o/r/git/refs/heads/" + HEARTBEAT_BRANCH in api8.calls
-          and "POST repos/o/r/git/refs" not in api8.calls):
-        print("       └ #%d 走的是 PATCH ref（blobs → trees(base_tree) → commits(有父) → "
-              "PATCH refs）" % n[0])
+    elif (r8["heartbeat_how"] == "create" and api8.puts
+          and "sha" not in api8.puts[0]):
+        print("       └ #%d 走的是 Contents API 建文件：payload 里**没有** `sha`"
+              "（带上会被当成「改一个不存在的文件」）" % n[0])
     else:
-        fail("⑧ 附属：文件不在时该走 PATCH ref 那条路",
-             "how=%s，调用 %s" % (r8["heartbeat_how"], [c for c in api8.calls if "refs" in c]))
+        fail("⑧ 附属：文件不在时该走「建文件、不带 sha」那条路",
+             "how=%s，PUT payload 的键 = %s"
+             % (r8["heartbeat_how"], sorted(api8.puts[0]) if api8.puts else "（没有 PUT）"))
 
-    # ⑨ / ⑩ / ⑪ 不变量 ① 的守卫：**联网之前**就该拒绝
-    for what, hb in (("⑨ 心跳分支 == 工作分支 ⇒ 拒绝", WORK),
-                     ("⑩ 心跳分支落在 ksu- 命名空间 ⇒ 拒绝", "ksu-heartbeat"),
-                     ("⑪ 心跳分支落在 lineage- 命名空间 ⇒ 拒绝", "lineage-heartbeat")):
-        n[0] += 1
-        try:
-            run(_args(work_dir=tmpdir, heartbeat_branch=hb), FakeApi(UP, LO, MB_SAME), log=_quiet)
-            fail(what, "没拒绝")
-        except UsageError:
-            print("  ✅ #%-2d %-46s -> UsageError" % (n[0], what))
-
-    # ⑫ / ⑬ 写后复核的两条：**两条都真的会失败**（回归闸，不是仪式）
-    for what, api_kw in (("⑫ 复核：工作分支被动过 ⇒ 报错", {"moved_sha": "e" * 40}),
-                         ("⑬ 复核：心跳分支不是孤儿（顶层不止一个文件）⇒ 报错",
-                          {"tree_paths": ["Makefile", "arch", "drivers", STATE_PATH]})):
+    # ⑫ / ⑬ / ⑭ 三条写后复核：**三条都真的会失败**（回归闸，不是仪式）。
+    #    ⚠️ 前两条正是不变量 ① 从「重读 `--branch`」升级成「比**全部** ref」的理由：
+    #       旧写法**看不见**这两件事（被推的不是 `--branch`）。
+    for what, api_kw in (
+            ("⑫ 复核：**另一条**工作分支被推了 ⇒ 报错",
+             {"refs_extra": {"refs/heads/ksu-cfi-experiment": "9" * 40}}),
+            ("⑬ 复核：凭空多出一个 `main` ⇒ 报错",
+             {"refs_extra": {"refs/heads/main": "f" * 40}}),
+            ("⑭ 复核：心跳分支不是孤儿（顶层不止一个文件）⇒ 报错",
+             {"tree_paths": ["Makefile", "arch", "drivers", STATE_PATH]})):
         n[0] += 1
         try:
             run(_args(work_dir=tmpdir),
@@ -749,6 +838,18 @@ def self_test(tmpdir):
             fail(what, "没报错")
         except RuntimeError as e:
             print("  ✅ #%-2d %-46s -> %s" % (n[0], what, str(e).split("\n")[0][:40]))
+
+    # ⑮ / ⑯ / ⑰ 不变量 ① 的名字守卫：**联网之前**就该拒绝
+    for what, hb in (("⑮ 心跳分支 == 工作分支 ⇒ 拒绝", WORK),
+                     ("⑯ 心跳分支落在 ksu- / lineage- 命名空间 ⇒ 拒绝", "ksu-heartbeat"),
+                     ("⑰ 心跳分支带 `refs/` 前缀（可绕过相等判定）⇒ 拒绝",
+                      "refs/heads/ksu-lineage-23.2")):
+        n[0] += 1
+        try:
+            run(_args(work_dir=tmpdir, heartbeat_branch=hb), FakeApi(UP, LO, MB_SAME), log=_quiet)
+            fail(what, "没拒绝")
+        except UsageError:
+            print("  ✅ #%-2d %-46s -> UsageError" % (n[0], what))
 
     total = n[0]
     print()
@@ -765,22 +866,20 @@ def main(argv):
     ap.add_argument("--repo", metavar="OWNER/REPO", help="本线工作仓库（写心跳的分支在它上面）")
     ap.add_argument("--branch", metavar="分支", help="**工作分支**（只读它，绝不写它）")
     ap.add_argument("--upstream-repo", metavar="OWNER/REPO", default="LineageOS/android_kernel_xiaomi_sm8250")
-    ap.add_argument("--upstream-branch", metavar="分支", default="lineage-23.2")
-    ap.add_argument("--upstream-sha", metavar="SHA", default=None,
-                    help="钉住上游某个提交（默认取 --upstream-branch 的 HEAD）")
+    ap.add_argument("--upstream-branch", metavar="分支或 SHA", default="lineage-23.2",
+                    help="上游的分支名**或**某个提交的 sha（`commits/{ref}` 两样都收）")
     ap.add_argument("--heartbeat-branch", metavar="分支", default=HEARTBEAT_BRANCH,
                     help="心跳分支（**孤儿分支**；默认 %s）" % HEARTBEAT_BRANCH)
     ap.add_argument("--state-path", metavar="路径", default=STATE_PATH,
                     help="心跳分支上的状态文件（默认 %s）" % STATE_PATH)
     ap.add_argument("--run-url", metavar="URL", default=None,
-                    help="写进心跳内容（内容因此每次都不同 ⇒ 不可能是空提交）")
-    ap.add_argument("--dry-run", action="store_true", help="只判定，不写任何东西")
-    ap.add_argument("--today", metavar="YYYY-MM-DD", help="「今天」（默认取 UTC 当天）")
-    ap.add_argument("--now-utc", metavar="ISO8601", default=None,
-                    help="心跳内容里的秒级时刻（默认取当前 UTC；自测/复现用）")
+                    help="写进心跳内容（事后追溯：哪一次运行写的心跳）")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="只判定、不写任何东西。⚠️ 它**不刷新**仓库的活动计时器（见文件头）")
+    ap.add_argument("--today", metavar="YYYY-MM-DD",
+                    help="「今天」（默认取 UTC 当天）—— 拿真数据验 30 天边界就靠它")
     ap.add_argument("--work-dir", metavar="目录", default=None,
                     help="放从心跳分支取回的状态文件（默认系统临时目录）")
-    ap.add_argument("--api-url", metavar="URL", default=API_DEFAULT)
     ap.add_argument("--json-out", metavar="文件", help="把结果写一份 JSON")
     ap.add_argument("--github-output", metavar="文件", help="写 `key=value`（喂 $GITHUB_OUTPUT）")
     ap.add_argument("--summary", metavar="文件", help="追加一段 Markdown（喂 $GITHUB_STEP_SUMMARY）")
@@ -801,9 +900,9 @@ def main(argv):
     if not token and not a.dry_run:
         print("⚠️  没有 GH_TOKEN / GITHUB_TOKEN：读接口是公开的，但**写心跳会 403**。")
         print("    只想知道结论就加 --dry-run。")
-    api = Api(a.api_url, token)
+    api = Api(token)
     try:
-        r = run(a, api, log=print, now_utc=a.now_utc)
+        r = run(a, api, log=print)
     except UsageError as e:
         print("用法错误：%s" % e)
         return EXIT_USAGE
