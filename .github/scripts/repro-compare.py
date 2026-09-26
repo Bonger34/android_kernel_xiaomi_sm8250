@@ -63,9 +63,9 @@ RULES = (
     ("provenance", lambda n: n == PROV),
     ("sums", lambda n: n == SUMS),
 )
-# 产品 = 参与逐字节比对的那些；元数据两类单列（它们**按定义**会因运行而异）。
+# 产品 = 参与逐字节比对的那些。元数据两类（`provenance` / `sums`）不参与判定：
+# 前者含本次运行的 URL，后者跟着前者走 —— 见文件头与 `compare()` 的注释。
 PRODUCT_ROLES = ("Image", "config", "System.map", "boot", "zip")
-META_ROLES = ("provenance", "sums")
 
 IMG_VER_RE = re.compile(r"^Image-(\S+?)-LOS\d")
 
@@ -336,13 +336,6 @@ def render(a, b, rows, fails, notes, krelease):
     A("本工具的结论与它必须一致；不一致时**以闸门为准**（闸门还会核三件套齐不齐、")
     A("KSU 符号、同源关系与哈希清单）。")
     return "\n".join(L)
-
-
-def print_report(txt, rows_note=None):
-    """把 Markdown 报告打到控制台（人读的是这一段，CI 摘要另存一份）。"""
-    print(txt)
-    if rows_note:
-        print(rows_note)
 
 
 def self_test():

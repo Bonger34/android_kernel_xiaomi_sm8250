@@ -458,6 +458,11 @@ jobs:
             --summary "$GITHUB_STEP_SUMMARY"
 
       # ★ 判定：闸门第六项（接缝 S1 —— 「这批产物能不能发」的唯一入口）。
+      #   ⚠️ `--profile auto`：**档位从产物的 `.config` 现推**，不由这里指定。
+      #      理由（2026-09-26 实测踩到）：档位取决于构建时 `disable_hardening` 传了什么，
+      #      而那是**另一个地方**的事 —— 写成 `--profile main` 时，一旦这次编出来的是
+      #      CFI 档，闸门就会因为**调用方把参数传错**而红。让工具自己读 `.config`
+      #      就没有这处耦合（`package.py` 的命名与档位早就是现算的，见 spec 决定 26 ③）。
       #   ⚠️ **先写摘要再退非零**：`run:` 一旦非零，后面的步骤就不跑了，
       #      而「不一致时摘要里也要看得见」正是上面那一步的全部用途。
       #      （同一形状的教训：PROJECT.md §7 坑表 #34 —— 早写下的结论会被晚发生的事推翻。）
@@ -466,7 +471,8 @@ jobs:
           set +e
           python3 .github/scripts/verify-release.py \
             "repro/los23.2-umi-${{ github.sha }}-a" \
-            --line los --repro "repro/los23.2-umi-${{ github.sha }}-b"
+            --line los --profile auto \
+            --repro "repro/los23.2-umi-${{ github.sha }}-b"
           RC=$?
           {
             echo ""

@@ -29,6 +29,12 @@
 `--profile` 决定对 CFI/SCS 的期望值：
   `main`（默认）—— Q13 的主线：CFI/SCS **必须关**，LTO 必须开
   `cfi-experiment` —— CFI 实验线：CFI/SCS **必须开**（见 docs/los-line/tickets.md T9）
+  `auto` —— ⭐ **从产物的 `.config` 现推**（`CONFIG_CFI_CLANG=y` ⇒ cfi-experiment，否则 main）。
+    ⚠️ 这个档位后来才补上，理由是**踩过一次**：CI 里调用方传了 `--profile main` 而实际
+    编出来的是 CFI 档（`disable_hardening` 没传），闸门当场红 —— 但红的原因是
+    **调用方把档位传错了**，不是产物有问题。`package.py` 早就是「命名/档位从产物现算」
+    （spec.md 追加决定 26 ③），闸门这边一直没有 ⇒ 同一处耦合散在两个地方。
+    产物本身同时带着 `.config` 与 Image，档位**答得出来**，所以让工具自己去读。
 `--lto-expect {y,n}`（默认 y）—— LTO 这一项的期望值。
   ⚠️ **LTO 不是我们定的，是上游该树自带的姿态**：23.2 的 `vendor/kona-perf_defconfig`
   自带 `CONFIG_LTO_CLANG=y`，我们只关 CFI/SCS/WERROR，LTO 是**保留**下来的；
@@ -429,6 +435,17 @@ def _verdict(fails, skipped=(), notes=()):
 
 
 def los_main(d, repro, profile="main", lto_expect="y"):
+    # ⚠️ `--profile auto`：从产物自己的 `.config` 现推档位。
+    #    为什么要有它：调用方要**同时**记住「构建时传了 disable_hardening 没有」与
+    #    「闸门该传哪个 profile」—— 2026-09-26 实测踩到一次（CI 里编出来是 CFI 档、
+    #    闸门按 main 查 ⇒ 当场红，而红的原因是参数传错，不是产物有问题）。
+    #    `package.py` 早就是「命名与档位从产物现算」，闸门这边补齐同一件事。
+    if profile == "auto":
+        cfg0 = _find(d, {".config"}, ("config-",))
+        cm0 = _cfg_map(cfg0) if cfg0 else {}
+        profile = "cfi-experiment" if cm0.get("CONFIG_CFI_CLANG") == "y" else "main"
+        print("档位：**auto** ⇒ 从产物的 `.config` 现推得 `%s`"
+              "（CONFIG_CFI_CLANG=%s）\n" % (profile, cm0.get("CONFIG_CFI_CLANG", "（不存在）")))
     print("线：LOS（LineageOS + KernelSU v0.9.5）｜ profile = %s ｜ LTO 期望 = %s"
           % (profile, lto_expect))
     print("资产目录: %s\n" % d)
