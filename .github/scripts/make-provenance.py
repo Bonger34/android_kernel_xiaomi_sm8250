@@ -83,17 +83,32 @@ def scan(d):
 def parse_fetch_log(path):
     """从 `fetch-base.py` 的输出里取期次 / 来源 / 官方 sha256。
 
-    解析不出来**就报错**（而不是静默留空）—— 那说明上游工具的输出格式变了，
-    来源说明会缺掉最关键的那一项，而它恰恰是这份文件存在的理由。
+    ⚠️ **这三行的形状是一份契约，不是实现细节。** 两个写入方必须逐字对齐：
+      ① `fetch-base.py` 自己（现拉底包那条路）；
+      ② `build.yml` 里「复用底包 artifact」那条路 —— 它**不下载**，但 `base-fetch.log` 必须
+         写成同样的形状，只是把期次/来源如实写成「复用 artifact：run <id> 的 <name>」。
+    2026-09-26 实测踩到：复用那条路第一版把来源写成了 `artifact:<run>/<name>`
+    （带 `.`/`/`，原来的正则 `^来源\\s+(\\S+)\\s*$` 与 `^期次\\s+(\\S+)\\s*$` 都匹配不上），
+    于是**封装链在写来源说明那一步整条中止** —— 而编译本身是好的。
+
+    ⚠️ **这里的正则故意放宽**（`(.+?)` 而不是 `(\\S+)`）：能解析的成功路径只有一条
+    （`fetch-base.py` 自己），把格式卡得过死**只会把失败模式变成「整条链中止」**，
+    而不是「写出一份缺字段的说明」。宽松的代价可控（期次/来源只写进说明，不参与任何判定），
+    换来的是「复用底包」这类**后续加进来的写入方**不必先去猜那个格式。
+    解析不出来**仍然报错** —— 缺了这三项，来源说明就答不出「我用的是哪一份底包」，
+    而它正是这份文件存在的理由。
     """
     txt = open(path, encoding="utf-8", errors="replace").read()
-    date = re.search(r"^期次\s+(\S+)\s*$", txt, re.M)
-    url = re.search(r"^来源\s+(\S+)\s*$", txt, re.M)
+    date = re.search(r"^期次\s+(.+?)\s*$", txt, re.M)
+    url = re.search(r"^来源\s+(.+?)\s*$", txt, re.M)
     off = re.search(r"^官方\s+(\d+) 字节  sha256 ([0-9a-f]{64})\s*$", txt, re.M)
     if not (date and url and off):
         raise SystemExit(
-            "从 %s 里解析不出「期次 / 来源 / 官方 sha256」三行 —— fetch-base.py 的输出格式变了。\n"
-            "   没有这三项，来源说明就答不出「我用的是哪一份底包」。" % path)
+            "从 %s 里解析不出「期次 / 来源 / 官方 sha256」三行 —— 那一份日志的格式不对。\n"
+            "   没有这三项，来源说明就答不出「我用的是哪一份底包」。\n"
+            "   ⇒ 两个写入方必须对齐：`fetch-base.py`（现拉），以及 `build.yml` 里\n"
+            "     「复用底包 artifact」那一段（它不下载，但日志要写成同样的形状）。\n"
+            "     该文件现在的内容：\n%s" % (path, "\n".join("       " + l for l in txt.splitlines()[:12])))
     return {"date": date.group(1), "url": url.group(1),
             "size": int(off.group(1)), "sha256": off.group(2)}
 

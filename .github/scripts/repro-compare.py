@@ -18,17 +18,19 @@
 ⇒ 逐字节比对必须**排除元数据**，只比产品（`Image` / `.config` / `System.map` /
 `boot-*.img` / `AK3 *.zip`）。顺带把它解析出来：两份的**底包 sha256** 若不同，
 就明说「两次编译用的不是同一份底包」—— 那是最容易被误读成「构建不可复现」的情形。
+⚠️ 但**「两份都有来源说明」是判定的**：逐字节相同的**半成品**不是交付物
+（封装链可能停在写说明那一步，而那时 `dist/` 里已经有五个产品了）。
 
 ## 用法
 
 ```sh
 python tools/repro-compare.py <目录A> <目录B>                     # 打印报告
 python tools/repro-compare.py <目录A> <目录B> --summary out.md    # 另写一份 Markdown
-python tools/repro-compare.py <目录A> <目录B> --allow-partial     # 允许缺整个角色（比三件套时用）
+python tools/repro-compare.py <目录A> <目录B> --allow-partial     # 允许缺整个产品角色（比三件套时用）
 python tools/repro-compare.py --self-test                         # 内置离线用例
 ```
 
-退出码：0 = 逐字节相同（或 `--self-test` 全过）；1 = 有差异 / 有缺件；
+退出码：0 = 逐字节相同（或 `--self-test` 全过）；1 = 有差异 / 有缺件（含缺来源说明）；
 2 = 用法错误。
 
 ⚠️ **本文件有两份，必须逐字节相同**：工作区 `tools/repro-compare.py`
@@ -241,6 +243,9 @@ def compare(a, b, allow_partial=False):
     if fails:
         # ⚠️ 缺件时**也**要出一份报告：CI 摘要与失败产物是一起留档的，
         #    摘要里只写一句「不相同」而不说缺了什么，事后诊断就没有材料。
+        # ⚠️ 顺带把「底包那一项没被核」也说出来 —— 缺件时我们**根本没走到**解析那一步，
+        #    不说的话，读的人会以为它被核过了。
+        notes.append("（缺件 ⇒ 底包 sha256 那一项**没被核**，`%s` 也没读）" % PROV)
         return render(a, b, [], fails, notes, krelease_of(ca)), fails, notes
 
     rows = []
@@ -263,21 +268,39 @@ def compare(a, b, allow_partial=False):
             fails.append("%s 两次构建不同：%s" % (role, detail))
         rows.append((role, os.path.basename(pa), sa, ha, sb, hb, same, detail))
 
-    # 元数据：不参与判定，但要把「为什么可能不同」说清楚
+    # 元数据：不参与**逐字节**判定，但「两份都在不在」是判定的 ——
+    # ⚠️ 2026-09-26 实测踩到：封装链在**写来源说明**那一步挂掉时，`dist/` 里已经有 5 个产品
+    #    （预检在写说明之前跑），于是第六项照样全绿、这一节的结论照样「逐字节相同」，
+    #    而那份产物**缺 PROVENANCE.md**。逐字节相同的**半成品**不是交付物 ——
+    #    所以「两份都得有来源说明」在这里当场判失败，把「不完整的绿」堵在这一层。
     def _meta(cat):
         p = _pick(cat, "provenance")
-        return parse_provenance(p[1]) if p else {}
+        return parse_provenance(p[1]) if p else None
 
     pa_, pb_ = _meta(ca), _meta(cb)
-    if pa_.get("base_sha256") and pb_.get("base_sha256"):
-        if pa_["base_sha256"] != pb_["base_sha256"]:
-            notes.append("⚠️ 两次的**底包不是同一份**（%s… vs %s…）—— "
-                         "产品不同是它的必然结果，先看这一条再看别的。"
-                         % (pa_["base_sha256"][:12], pb_["base_sha256"][:12]))
+    if pa_ is None or pb_ is None:
+        side = "两侧都没有" if pa_ is None and pb_ is None else ("A 侧没有" if pa_ is None else "B 侧没有")
+        # ⚠️ `allow_partial` 也认这个例外：**三件套 artifact**（`kernel-image`）本来就只出
+        #    三个产品、没有壳/zip，也没有来源说明 —— 用 `--allow-partial` 比它时不该因此判失败。
+        #    反过来，默认路径（发布产物）**必须**两份都有来源说明：
+        #    逐字节相同的**半成品**不是交付物（实测踩到：封装链停在「写来源说明」那一步时，
+        #    `dist/` 里已经躺着五个产品，于是这一节会「全绿」而产物其实是残的）。
+        if allow_partial:
+            notes.append("（%s 缺 `%s` —— 本次 `--allow-partial`，那一项**没被核**）" % (side, PROV))
         else:
-            notes.append("底包同一份：`%s`" % pa_["base_sha256"])
+            fails.append("%s：%s —— 逐字节相同的**半成品**不是交付物"
+                         "（封装链可能停在写说明那一步）" % (PROV, side))
+            notes.append("（%s ⇒ 底包 sha256 那一项**没被核**）" % side)
     else:
-        notes.append("（两侧没能都读到 `%s` 的底包 sha256 —— 那一项**没被核**）" % PROV)
+        if pa_.get("base_sha256") and pb_.get("base_sha256"):
+            if pa_["base_sha256"] != pb_["base_sha256"]:
+                notes.append("⚠️ 两次的**底包不是同一份**（%s… vs %s…）—— "
+                             "产品不同是它的必然结果，先看这一条再看别的。"
+                             % (pa_["base_sha256"][:12], pb_["base_sha256"][:12]))
+            else:
+                notes.append("底包同一份：`%s`" % pa_["base_sha256"])
+        else:
+            notes.append("（两侧没能都读到 `%s` 的底包 sha256 —— 那一项**没被核**）" % PROV)
 
     return render(a, b, rows, fails, notes, krelease_of(ca)), fails, notes
 
@@ -420,15 +443,28 @@ def self_test():
     case("边界：PROVENANCE/SHA256SUMS 不同 ⇒ 仍判相同", c5)
 
     def c6(tmp):
+        # ⚠️ 两侧都没有 PROVENANCE ⇒ **判失败**：逐字节相同的半成品不是交付物。
+        #    这条是 2026-09-26 实测补上的 —— 封装链停在「写来源说明」那一步时，
+        #    dist 里已经躺着 5 个产品（预检在写说明之前跑），于是这一节会「全绿」。
         a, b = pair(tmp)
-        for n in (PROV, SUMS):
-            os.remove(os.path.join(b, n))
+        for d in (a, b):
+            os.remove(os.path.join(d, PROV))
         txt, fails, notes = compare(a, b)
-        assert not fails, "元数据缺失不该判失败：%s" % fails
+        assert fails and any(PROV in f for f in fails), fails
         assert any("没被核" in n for n in notes), notes
-        return "0，且明说底包那一项没被核"
+        return "1，明说两份都缺来源说明，且底包那一项没被核"
 
-    case("边界：一侧没有 PROVENANCE ⇒ 不失败但要说清楚", c6)
+    case("负向：两侧都没有 PROVENANCE ⇒ 失败（半成品不是交付物）", c6)
+
+    def c6b(tmp):
+        # 只有一侧有：**同样判失败**（另一侧是半成品）
+        a, b = pair(tmp)
+        os.remove(os.path.join(b, PROV))
+        _txt, fails, _n = compare(a, b)
+        assert fails and any("B 侧没有" in f for f in fails), fails
+        return "1，指出是哪一侧缺"
+
+    case("负向：只有一侧有 PROVENANCE ⇒ 失败", c6b)
 
     def c7(tmp):
         a, _b = pair(tmp)
@@ -453,10 +489,13 @@ def self_test():
 
     def c10(tmp):
         # 三件套 artifact（**两侧都**没有壳与 zip）：默认判失败，--allow-partial 才比
+        # ⚠️ `PROVENANCE.md` 也一并去掉 —— 三件套 artifact 里本来就没有它，
+        #    而它是**独立于 `--allow-partial`** 的硬要求（见 c6）。
         a, b = pair(tmp)
         for d in (a, b):
             for n in ("boot-LOS23.2-ksu-0.9.5-umi.img",
-                      "AnyKernel3-LOS23.2-ksu-0.9.5-umi.zip"):
+                      "AnyKernel3-LOS23.2-ksu-0.9.5-umi.zip",
+                      PROV):
                 os.remove(os.path.join(d, n))
         _txt, fails, _n = compare(a, b)
         assert fails, "默认必须要求五件俱全（缺了就不比 = 不完整的绿）"
@@ -500,8 +539,9 @@ def main(argv):
     ap.add_argument("--summary", metavar="路径",
                     help="额外写一份 Markdown（CI 里给 $GITHUB_STEP_SUMMARY）")
     ap.add_argument("--allow-partial", action="store_true",
-                    help="允许某一侧缺整个角色（比 `kernel-image` 那种三件套 artifact 时用）；"
-                         "默认要求五件俱全 —— 「缺了就不比」会让不完整的比对看起来像全绿")
+                    help="允许某一侧缺整个**产品**角色（比 `kernel-image` 那种三件套 artifact 时用）；"
+                         "默认要求五件俱全 —— 「缺了就不比」会让不完整的比对看起来像全绿。"
+                         "⚠️ `PROVENANCE.md` 不在此列：两份都必须有（它是交付物的一部分）")
     ap.add_argument("--self-test", action="store_true", help="跑内置离线用例（不联网）")
     a = ap.parse_args(argv[1:])
 

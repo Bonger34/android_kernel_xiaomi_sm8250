@@ -24,7 +24,9 @@
 
 `--repro` 指向另一次同配方构建的目录，用来验证「两次构建逐字节相同」。
 ⚠️ 第六项比的是**产品**：`Image` / `.config` / `System.map` / 壳 / AK3 zip ——
-缺任何一件都判**失败**（「缺了就不比」会让一次不完整的比对看起来像全绿）。
+缺任何一件都判**失败**（「缺了就不比」会让一次不完整的比对看起来像全绿）；
+⚠️ 而且两份都必须带 `PROVENANCE.md` —— 逐字节相同的**半成品**不是交付物
+（封装链可能停在写说明那一步，而那时 `dist/` 里已经有五个产品了）。
 只出三件套的 artifact 请改用 `tools/repro-compare.py --allow-partial`。
 `--profile` 决定对 CFI/SCS 的期望值：
   `main`（默认）—— Q13 的主线：CFI/SCS **必须关**，LTO 必须开
@@ -623,6 +625,15 @@ def los_main(d, repro, profile="main", lto_expect="y"):
                          "不是「同输入却编出不同字节」" % (b1[:12], b2[:12]))
         elif b1 and b1 == b2:
             print("  底包同一份：%s" % b1[:32])
+
+        # ⚠️ **来源说明必须在**（2026-09-26 实测补的）：预检闸门跑在**写来源说明之前**，
+        #    所以封装链停在「写说明」那一步时，`dist/` 里已经有五个产品 ⇒ 上面 5/5 全绿，
+        #    而那份产物其实是**残的**。既然是「两次构建能不能发」，就得要求两份都是**完整**
+        #    的产物目录。只给一个目录跑体检时（没有 `--repro`）不受这条约束。
+        if not _find(d, {"PROVENANCE.md"}) or not _find(repro, {"PROVENANCE.md"}):
+            miss = "本目录" if not _find(d, {"PROVENANCE.md"}) else "`--repro` 目录"
+            fails.append("第六项：%s 里没有 PROVENANCE.md —— 逐字节相同的**半成品**不是交付物"
+                         "（封装链可能停在写说明那一步）" % miss)
 
     return _verdict(fails, skipped, notes)
 

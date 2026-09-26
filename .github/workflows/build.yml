@@ -219,8 +219,14 @@ jobs:
             [ -n "$BASE" ] || { echo "❌ $BASE_ARTIFACT 里找不到 base*.img"; exit 1; }
             cp "$BASE" base.img
             BSHA="$(sha256sum base.img | cut -d' ' -f1)"
-            { echo "期次   （复用 artifact：run ${BASE_RUN_ID} 的 $BASE_ARTIFACT）"
-              echo "来源   artifact:${BASE_RUN_ID}/$BASE_ARTIFACT"
+            # ⚠️ 这份日志要写成 `fetch-base.py` **同样的三行形状**（期次 / 来源 / 官方 sha256）
+            #    —— `make-provenance.py` 按那个形状解析，写歪了会让**封装链整条中止**
+            #    （2026-09-26 实测踩到：第一版来源写成 `artifact:<run>/<name>`，
+            #    正则匹配不上 ⇒ 停在「写来源说明」那一步，而编译本身是好的）。
+            #    来源如实写成 `artifact:<run>/<name>`；`date` 位写「复用的期次」，
+            #    没有钉期次时如实写「（未钉期次）」，**不编一个日期**。
+            { echo "期次   ${BASE_DATE:-（未钉期次）}"
+              echo "来源   artifact:${BASE_RUN_ID}/${BASE_ARTIFACT}"
               echo "官方   $(stat -c%s base.img) 字节  sha256 $BSHA"
             } > base-fetch.log
             echo "  复算件 base.img sha256 = $BSHA"
