@@ -100,6 +100,18 @@ on:
 #     红的运行**根本不会调用** `promote.py` ⇒ 「分支一个字节都不动」是结构性的，
 #     而不是靠工具自己克制。工具本身是 `promote.py`（接缝 S6），它只发**一次**
 #     `PATCH refs/heads/<分支>` 且 `force: false`。
+#
+#  失败上报（issue #10，规格实现决定 7）
+#
+#  红了的时候多一个 `notify` job：开 issue（含上游提交号与失败环节）、把「这个上游提交
+#  已经试过」记进心跳分支的状态文件（检测器据此判 `blacklisted`、**不再为它触发构建**）、
+#  并把失败产物列进 issue。判定与写入都在 `.github/scripts/report-failure.py` 里。
+#
+#  ⚠️ **超时 / 取消 / 启动失败不算失败**（规格原话）：它们不写标记、不开 issue，
+#     下一轮自己重试 —— 一次偶发的基础设施抖动不该把某个上游提交拉黑 7 天。
+#     判定走 **job 级**结论（工具跑在自己的 run 里，**看不到** run 级的结论）；
+#     「取消」的另一半保证是结构性的：被取消的 run 里 `notify`（`if: failure()`）通常
+#     根本不会开始。
 # ══════════════════════════════════════════════════════════════════════════════
 
 env:
@@ -110,6 +122,11 @@ env:
   # 临时 ref：检测器用它把那次合并的提交**种子投放**到服务端（#9）。
   # ⚠️ 必须与 `detect.yml` 的 `STAGING_REF` 一致。这里用它做**推前复核**与**收尾清理**。
   STAGING_REF: sync-staging
+  # 心跳分支（**孤儿分支**）：失败标记（`failed`，写它的是 #10）与心跳（`heartbeat`，
+  # 写它的是检测器）共用它上面的 `sync-state.json`。
+  # ⚠️ 必须与 `detect.yml` 的 `HEARTBEAT_BRANCH` 一致 —— 两处写歪一个就是
+  # 「标记写在这条、检测器读那条」，而两边看起来**都是绿的**。
+  HEARTBEAT_BRANCH: sync-heartbeat
 
 jobs:
   # ══ 准备：环境哨兵 + 取一次底包 ═══════════════════════════════════════════════
@@ -872,3 +889,67 @@ jobs:
             echo "⚠️ 删 $STAGING_REF 失败 —— **不影响判据**（它只是运输工具）。"
             echo "   下一轮检测器会把它**覆盖**成新一次合并的提交，所以不会累积。"
           fi
+
+  # ══ 失败上报：**红了就叫人与拉黑**（issue #10）═════════════════════════════════
+  # 规格 `docs/los-line/upstream-sync-spec.md` 实现决定 7（用户故事 6~11）三件事：
+  #   ① 开一个 issue 说清失败（**含上游提交号与失败环节**）；
+  #   ② 记下「这个上游提交已经试过」⇒ 检测器判 `blacklisted`（退出码 20），
+  #      **不再为它触发构建**（那正是「同一个提交失败后不再重试」）；
+  #   ③ 同一个提交再失败 ⇒ **追加评论**，不新建 issue（去重靠标题里那 12 位短 sha）。
+  #
+  # ⚠️ `if: failure()` 是有意的：**绿的运行根本不跑这个 job**（不花 runner）。
+  #    「超时 / 取消不算失败」这条，一半是结构性的（被取消的 run 里这个 job 通常
+  #    根本不会开始），另一半在工具里（job 级结论 `cancelled` / `timed_out` 一律判抖动）——
+  #    后者是必要的，因为一次被取消的 run 里往往还夹着「因为依赖被取消而报 failure」的
+  #    次生 job，只看有没有 failure 会**把一次基础设施抖动变成一次 7 天的拉黑**。
+  #
+  # ⚠️ `inputs.upstream_sha != ''`：手动触发的兜底路径没有上游提交可记
+  #    （没有拉黑的对象，也没有稳定的 issue 标题可去重）⇒ 不叫。工具里有同义的第二道守卫。
+  #
+  # ⚠️ **判定一行都不在 YAML 里**：`report-failure.py` 自己读这次 run 的 job 列表
+  #    （谁红了、红在第几步）与产物清单，再决定写什么。同 `detect.py` / `package.py`
+  #    的理由：本机没有可用的 bash，写在 YAML 里的逻辑只能上 CI 试，一轮十几分钟。
+  notify:
+    needs: [prepare, build, repro]
+    if: failure() && inputs.upstream_sha != ''
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    # ⚠️ **一旦写了 `permissions:`，没列出的权限一律变 `none`。**
+    #    `contents: write` = 把失败标记写进心跳分支；`issues: write` = 开 issue / 追加评论；
+    #    `actions: read` = 读本 run 的 job 列表与产物清单。
+    #    漏掉任何一个都只会在**跑完 20 分钟之后**才报 403
+    #    `Resource not accessible by integration`（规格实现决定 1 记的那条坑）。
+    permissions:
+      contents: write
+      issues: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "失败上报：开 issue + 记下这个上游提交（issue #10）"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # ⚠️ 退出码**有语义**：0 = 处置完成（**含「抖动 ⇒ 不写标记、不开 issue」这一档**），
+          #    1 = 运行错误，2 = 用法错误。工具不会因为它自己判出「抖动」而返非零 ——
+          #    把四种结论压成「非零即错」会让一次正常的抖动看起来像故障。
+          # ⚠️ `--self-job notify`：本工具就活在这个 job 里，而它此刻的结论还是 `null`
+          #    ⇒ 判定必须知道「哪个 job 是自己」，否则**自己那一步的失败会被漏掉**。
+          python3 .github/scripts/report-failure.py \
+            --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --self-job notify \
+            --upstream-sha "${{ inputs.upstream_sha }}" \
+            --merge-sha "${{ inputs.merge_sha }}" \
+            --merge-base "${{ inputs.merge_base }}" \
+            --base-sha256 "${{ inputs.base_sha256 }}" \
+            --work-branch "$WORK_BRANCH" \
+            --heartbeat-branch "$HEARTBEAT_BRANCH" \
+            --json-out report-failure.json \
+            --summary "$GITHUB_STEP_SUMMARY"
+          echo "──────── 机器可读的结果（report-failure.json）────────"
+          cat report-failure.json
+          echo "───────────────────────────────────────────────"
