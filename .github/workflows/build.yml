@@ -107,6 +107,9 @@ env:
   # 必须一致 —— 两处写歪一个，「检测器试合并的分支」与「构建器推进的分支」就不是同一条。
   # （#9 起构建器也会写它，所以这个变量在这里**不再是只读的展示用**。）
   WORK_BRANCH: ksu-lineage-23.2
+  # 临时 ref：检测器用它把那次合并的提交**种子投放**到服务端（#9）。
+  # ⚠️ 必须与 `detect.yml` 的 `STAGING_REF` 一致。这里用它做**推前复核**与**收尾清理**。
+  STAGING_REF: sync-staging
 
 jobs:
   # ══ 准备：环境哨兵 + 取一次底包 ═══════════════════════════════════════════════
@@ -755,9 +758,13 @@ jobs:
           # ★ 判定与写入都在工具里（接缝 S6）。它只发**一次**写请求：
           #    `PATCH refs/heads/<分支>`，`force: false` ⇒ 非快速前进时平台自己拒。
           #    退出码 3（分支已前进）与 4（并发被抢）都是**正常结论**：这次不推，分支没动。
+          #    ⚠️ `--staging-ref` 是**种子投放的复核**：检测器把合并提交推到那儿，
+          #    服务端才认它（本地 `commit-tree` 造的对象 REST 全 404 —— 实测）。
+          #    没有它，PATCH 会回一句看不懂的 `Object does not exist`。
           set +e
           python3 .github/scripts/promote.py \
             --repo "$GITHUB_REPOSITORY" --branch "$WORK_BRANCH" --repo-dir . \
+            --staging-ref "$STAGING_REF" \
             --merge-sha "$MSHA" \
             --base-sha "$PARENT" \
             --upstream-sha "${{ inputs.upstream_sha }}" \
@@ -839,3 +846,29 @@ jobs:
             echo ""
             echo "⇒ 「工作分支 = 可发布状态」：只有**整条链全绿**才会走到这一步。"; } \
             >> "$GITHUB_STEP_SUMMARY"
+
+      # ⚠️ **收尾清理**：删掉种子投放用的临时 ref。
+      #    到了这里它已经**没有用了**（工作分支指向那个提交之后，它自己就是可达对象），
+      #    留着只会让仓库多一条「看不出用途」的分支。
+      #    ⚠️ 顺序**必须在推分支之后**：删早了，那个提交又变成不可达对象
+      #    （服务端可能在 PATCH 之前就把它收走 —— 这正是本轮 422 的教训）。
+      #    ⚠️ `if: always()`：构建红、或上面那一步让路（3/4）时**也**该清 ——
+      #    本轮不会再推了，而下一轮检测器会重新投放它自己的那个。
+      #    ⚠️ 清理失败**不让 job 红**（它不影响任何判据）：只打一行警告。
+      - name: "收尾清理：删掉种子投放用的临时 ref"
+        if: always() && inputs.merge_sha != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          SHA="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$STAGING_REF" --jq .object.sha 2>/dev/null || true)"
+          if [ -z "$SHA" ]; then
+            echo "  临时 ref $STAGING_REF 本来就不在（检测器那一步可能没跑到）—— 没什么可清的"
+            exit 0
+          fi
+          if gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$STAGING_REF"; then
+            echo "✅ 已删除临时 ref $STAGING_REF（它此前指向 $SHA）"
+          else
+            echo "⚠️ 删 $STAGING_REF 失败 —— **不影响判据**（它只是运输工具）。"
+            echo "   下一轮检测器会把它**覆盖**成新一次合并的提交，所以不会累积。"
+          fi
