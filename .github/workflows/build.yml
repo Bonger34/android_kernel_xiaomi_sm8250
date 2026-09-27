@@ -755,8 +755,14 @@ jobs:
             exit 1
           fi
           echo "✅ 工作分支 $WORK_BRANCH = $NOW（= 这次合并）"
-          # ⚠️ 摘要里用**本步算出来的** shell 变量（`$NOW`），不用 `${{ steps... }}`：
-          #    一个 step 引用自己的 outputs 渲染出来是空的（PROJECT.md §7 坑表 #39）。
+          # ⚠️ 摘要里用**本步已经算出来的** shell 变量（上面那个 `$NOW`），
+          #    不要去引用本步自己的 outputs 表达式 —— 一个 step 引用**自己**的 outputs
+          #    渲染出来是**空的**（PROJECT.md §7 坑表 #39；docs/los-line/tickets.md 的 #8 一节实测过）。
+          #    🚨 **连写在注释里都不行**：Actions 的表达式解析器会扫 `run:` 块的**全文**，
+          #    一句写歪的表达式定界符（两个花括号夹着 `…` / `steps...` 这类东西）
+          #    会让**整个 workflow 文件失效** —— 症状是派发时 422
+          #    `Invalid Argument - failed to parse workflow`，
+          #    而那与「inputs 写错」的 422 长得一模一样（本工单实测踩到两次，见 tickets.md #9 一节）。
           { echo ""; echo "### 推进工作分支（#9）"; echo ""
             echo "\`$WORK_BRANCH\` 复读远端 = \`$NOW\`（= 这次合并，读**远端** ref 复核）"
             echo ""
