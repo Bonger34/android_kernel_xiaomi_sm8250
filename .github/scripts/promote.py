@@ -21,8 +21,38 @@
    于是「覆盖掉别人刚推的东西」在结构上不可能 —— 这正是验收第 4 条
    （「检测器与构建器不会同时写同一条工作分支」）要的那个性质。
 3. **「这次合并确实是那个东西」要在推之前独立复核**，而不是信调用方传进来的三个 sha：
-   `父[0] == --local-sha`（本线 HEAD）且 `父[1] == --upstream-sha`（上游提交）。
+   `父[0] == --base-sha`（试合并时的本线 HEAD）且 `父[1] == --upstream-sha`（上游提交）。
    两个父都对不上时**一个请求都不发**（退出码 2）。
+
+> ⚠️ **`--base-sha` 是刻意做成一条判据的**，而不是「某个可传可不传的 sha」：
+> 漏传时那条判据会**静默消失** —— 又一次「不完整的全绿」。
+> 于是 `--merge-sha` / `--base-sha` / `--upstream-sha` **三个都是必填**。
+>
+> 🚨 **调用方怎么拿到 `--merge-sha`（这一条第一版写错了，独立审查抓到）**：
+> `try-merge.py --no-checkout` **刻意不移动 HEAD**（它自己有断言），
+> 所以重放完之后 **`git rev-parse HEAD` 给的是 checkout 出来的分支尖端，不是合并提交**。
+> 正确做法是读重放那一步**写出来的输出**：
+>
+> ```sh
+> python3 …/try-merge.py --no-checkout --repo-dir . \
+>     --work-branch "$WORK_BRANCH" --upstream-url "$UPSTREAM_URL" \
+>     --upstream-sha "$UPSTREAM_SHA" --merge-base "$MERGE_BASE" \
+>     --expect-merge-sha "$MERGE_SHA" --github-output "$GITHUB_OUTPUT"
+> MSHA="$(sed -n 's/^merge_sha=//p' "$GITHUB_OUTPUT" | tail -1)"
+> [ "$MSHA" = "$MERGE_SHA" ] || exit 1     # ⚠️ 这一步别省，见下
+> PARENT="$(git rev-parse "$MSHA^1")"      # 父[0] —— 试合并时的本线 HEAD
+> python3 …/promote.py --merge-sha "$MSHA" --base-sha "$PARENT" \
+>     --upstream-sha "$UPSTREAM_SHA" …
+> ```
+>
+> ⚠️ **那个 `[ "$MSHA" = "$MERGE_SHA" ]` 不是多余的**：`try-merge.py` 的
+> `--expect-merge-sha` 已经核过一次，但**它的结果除了「这一步的退出码」之外没有任何人读**
+> —— 这一步的退出码会被 `case` 吞掉。多这一句，「要推的 = 编过的」才是一条**看得见**的判据。
+>
+> ⚠️ 为什么非得绕这一道（本工单实测）：`workflow_dispatch` 的 inputs 不接受未声明的名字，
+> 原先给它单开一个 `local_sha` 输入之后，`trigger-build.py` 的派发**当场 422**
+> （`Unexpected inputs provided: ["local_sha"]`）。少一个能写歪的输入本来也更好 ——
+> 「试合并时的本线 HEAD」就是合并提交的父[0]，不必请人去传。
 
 ## 五条不变量
 
@@ -94,22 +124,27 @@ python3 .github/scripts/try-merge.py --no-checkout --repo-dir . \
 
 ```sh
 # CI（build.yml 的 repro job，**全绿之后**那一步）
-# ① 先重放那次合并（合并提交只在 build job 的对象库里，repro 这个 job 是新的检出）
+# ① 先重放那次合并（合并提交只在 build job 的对象库里，repro 这个 job 是新的检出）。
+#    🚨 `--merge-sha` **不能**用 `git rev-parse HEAD` —— `--no-checkout` 刻意不移动 HEAD，
+#       那时 HEAD 是**分支尖端**。从重放那一步写出来的输出里读（见上面的详注）。
 python3 .github/scripts/try-merge.py --no-checkout --repo-dir . \
     --work-branch "$WORK_BRANCH" --upstream-url "$UPSTREAM_URL" \
     --upstream-sha "$UPSTREAM_SHA" --merge-base "$MERGE_BASE" \
-    --expect-merge-sha "$MERGE_SHA"
+    --expect-merge-sha "$MERGE_SHA" --github-output "$GITHUB_OUTPUT"
+MSHA="$(sed -n 's/^merge_sha=//p' "$GITHUB_OUTPUT" | tail -1)"
+[ "$MSHA" = "$MERGE_SHA" ] || { echo "重放出来的不是检测器给的那个"; exit 1; }
 # ② 再推（唯一入口；`success()` 保证红的运行走不到这里）
 python3 .github/scripts/promote.py \
     --repo "$GITHUB_REPOSITORY" --branch "$WORK_BRANCH" --repo-dir . \
-    --merge-sha "$MERGE_SHA" --local-sha "$LOCAL_SHA" --upstream-sha "$UPSTREAM_SHA" \
+    --merge-sha "$MSHA" --base-sha "$(git rev-parse "$MSHA^1")" \
+    --upstream-sha "$UPSTREAM_SHA" \
     --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-    --summary "$GITHUB_STEP_SUMMARY" --github-output "$GITHUB_OUTPUT"
+    --summary "$GITHUB_STEP_SUMMARY"
 
 # 本机：只读演练（判据全跑，一条写请求都不发）
 python tools/promote.py --repo Bonger34/android_kernel_xiaomi_sm8250 \
     --branch ksu-lineage-23.2 --repo-dir build/los \
-    --merge-sha <sha> --local-sha <sha> --upstream-sha <sha> --dry-run
+    --merge-sha <sha> --base-sha <sha> --upstream-sha <sha> --dry-run
 
 python tools/promote.py --self-test      # 离线，临时仓库 + 真 git + 假 API，不联网
 ```
@@ -153,9 +188,9 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?"
 # 控制台是 GBK：不先改 stdout 编码，满屏的 ✅/❌ 会直接抛 UnicodeEncodeError。
 # ⚠️ 放在**模块级**而不是 `main()` 里：自测与应用都会调本模块的函数，
 #    只有 `main()` 里那一份的话，`import` 走的路径没有这道保护。
-#    ⚠️ 不用 `line_buffering=True`：本文件自己**不**派生会抢 fd 1 的子进程
-#    （`package.py` 那条坑表 #33 的理由在这里不成立），而 `_load_sibling()` 会把
-#    `try-merge.py` 拉进来 —— 那个模块的 `main()` 也 reconfigure 一次，两边都改会互相干扰。
+# ⚠️ 不用 `line_buffering=True`：那个开关是给「**自己派生的子进程直接写 fd 1**」的脚本用的
+#    （`package.py` 踩过，坑表 #33）。本文件所有 git 调用都走 `run()`，
+#    它们的 stdout/stderr 被重定向到**临时文件**、没有任何子进程写 fd 1 ⇒ 理由不成立。
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -293,15 +328,6 @@ def qs(x):
     return urllib.parse.quote(x, safe="")
 
 
-def with_q(path, **kw):
-    """按**现有**查询串是否存在来决定用 `?` 还是 `&`（拼错一次就是 404）。"""
-    q = urllib.parse.urlencode({k: v for k, v in kw.items() if v is not None})
-    if not q:
-        return path
-    sep = "&" if "?" in path else "?"
-    return "%s%s%s" % (path, sep, q)
-
-
 def assert_sha(name, value):
     """形状守卫：40 位十六进制。写歪的 sha 会让 API 去取一个不存在的东西，
     而那时的报错完全看不出是「参数写错了」。"""
@@ -315,12 +341,28 @@ def assert_sha(name, value):
 def assert_branch(name):
     """分支名的形状守卫。⚠️ `refs/` 前缀、空白、`..` 一律拒绝：本工具会把它拼进
     `refs/heads/<branch>`，写歪了就会去写一条**别的** ref —— 而那条 ref 是
-    `sync-heartbeat` 或别的什么，谁也没打算动它（`detect.py` 的同名守卫同理）。"""
-    if (not name or name.strip() != name or any(c in name for c in " \t\n\\")
-            or name.startswith("/") or name.endswith("/")
-            or ".." in name or name.startswith("refs/")):
-        raise Usage("--branch 不合法（为空 / 带首尾空白 / 含空白、反斜杠、`..`，"
-                    "或以 `/`、`refs/` 开头或结尾）：%r" % name)
+    `sync-heartbeat` 或别的什么，谁也没打算动它（`detect.py` 的同名守卫同理）。
+
+    ⚠️ 除了「本项目那几条」之外，这里也把 **git 自己的 ref 规则**里被禁的字符挡掉
+    （`~ ^ : ? * [ \\` 与控制字符、`@{`、首尾点、`.lock` 结尾）——
+    否则它们只能靠 API 兜底成 404，而 404 在调用方看来是「分支不存在」，
+    与本意（「名字写歪了」）差着一层。
+    """
+    bad = []
+    if not name or name.strip() != name:
+        bad.append("为空或带首尾空白")
+    if any(c in name for c in " \t\n\\~^:?*["):
+        bad.append("含空白、反斜杠或 git 禁用的字符（`~ ^ : ? * [`）")
+    if any(ord(c) < 32 or ord(c) == 127 for c in name):
+        bad.append("含控制字符")
+    if name.startswith("/") or name.endswith("/") or name.endswith("."):
+        bad.append("以斜杠或点开头 / 结尾")
+    if ".." in name or "@{" in name or name.endswith(".lock"):
+        bad.append("含 `..` / `@{`，或以 `.lock` 结尾")
+    if name.startswith("refs/"):
+        bad.append("以 `refs/` 开头")
+    if bad:
+        raise Usage("--branch 不合法（%s）：%r" % ("；".join(bad), name))
     return name
 
 
@@ -422,15 +464,9 @@ def assert_local_commit(repo, sha, what):
 
 
 def head_ref(repo):
-    """当前检出的那个 ref 名（detached ⇒ `HEAD`）。"""
+    """当前检出的那个 ref 名（detached ⇒ `HEAD`）。**只用于日志** ——
+    推分支与 HEAD 无关（见文件头 ⑤）。"""
     return git_out(repo, "rev-parse", "--abbrev-ref", "HEAD")
-
-
-def rev_parse(repo, rev):
-    rc, out, err = git(repo, "rev-parse", "--verify", rev, check=False)
-    if rc != 0:
-        raise Usage("取不到 %s：%s" % (rev, (err or out).strip()[:200]))
-    return out.strip()
 
 
 def _load_sibling(name, filename):
@@ -458,7 +494,7 @@ def _load_sibling(name, filename):
 def promote(a, api, log=print):
     """全部行为。返回结果字典（同时是 `--json-out` 与 `--github-output` 的来源）。"""
     a.merge_sha = assert_sha("--merge-sha", a.merge_sha)
-    a.local_sha = assert_sha("--local-sha", a.local_sha)
+    a.base_sha = assert_sha("--base-sha", a.base_sha)
     a.upstream_sha = assert_sha("--upstream-sha", a.upstream_sha)
     a.branch = assert_branch(a.branch)
 
@@ -480,12 +516,12 @@ def promote(a, api, log=print):
         raise Usage("合并提交 %s 有 %d 个父（应为 2）。\n"
                     "   ⇒ 它不是 `try-merge.py` 造出来的那个合并提交 —— "
                     "别把别的东西推上去。" % (a.merge_sha[:12], len(parents)))
-    if parents[0] != a.local_sha:
-        raise Usage("合并提交的父[0] 是 %s，而 --local-sha 是 %s —— 对不上。\n"
+    if parents[0] != a.base_sha:
+        raise Usage("合并提交的父[0] 是 %s，而 --base-sha 是 %s —— 对不上。\n"
                     "   ⇒ 一个请求都不发。最可能的原因：\n"
                     "     ① 检测器看到的**本线 HEAD** 与这次构建重放时用的不是同一个；\n"
                     "     ② 合并提交是从别的地方来的（手填？另一条分支？）。"
-                    % (parents[0], a.local_sha))
+                    % (parents[0], a.base_sha))
     if parents[1] != a.upstream_sha:
         raise Usage("合并提交的父[1] 是 %s，而 --upstream-sha 是 %s —— 对不上。\n"
                     "   ⇒ 一个请求都不发：那说明这次合并**合的不是那个上游提交**，"
@@ -519,14 +555,14 @@ def promote(a, api, log=print):
         log("       它不是推分支的前提：父[1] 那一条已经证明「合的就是那个提交」。")
 
     # ── ④ 读远端 ref（推之前的**第一道**守卫；第二道是 force=false 本身）──────
-    remote = read_ref(api, a.repo, a.branch, log)
+    remote = read_ref(api, a.repo, a.branch)
     d = decide(remote, parents[0], a.merge_sha,
                lambda x, y: git(a.repo_dir, "merge-base", "--is-ancestor", x, y,
                                 check=False)[0] == 0)
     log("  远端 %s = %s" % (a.branch, remote or "（不存在）"))
     result = {
         "repo": a.repo, "branch": a.branch, "merge_sha": a.merge_sha,
-        "local_sha": a.local_sha, "upstream_sha": a.upstream_sha,
+        "base_sha": a.base_sha, "upstream_sha": a.upstream_sha,
         "merge_date": m_date, "upstream_date": u_date,
         "remote_before": remote, "remote_after": None,
         "decision": d.kind, "exit_code": d.exit_code, "reason": d.reason,
@@ -541,7 +577,10 @@ def promote(a, api, log=print):
         log("          （检测器又发现了一次漂移，那时分支已经动了）；")
         log("       ② 有人在构建期间手推了这条分支。")
         log("     两种都不该自动处理：等下一轮检测器按**新的** HEAD 重新试合并。")
-        raise RefMoved(d.reason, result=result)
+        result["exit_code"] = EXIT_REF_MOVED
+        # ⚠️ 消息**不带** `d.reason`：上面已经逐字打过一遍了，而 `main()` 的异常处理
+        #    还会再打一行 —— 带上的话同一条结论会出现三次（实测踩到）。
+        raise RefMoved("分支已前进 ⇒ 本次不推（退出码 %d）" % EXIT_REF_MOVED, result=result)
     if d.kind == "already":
         result["remote_after"] = remote
         log("✅ %s —— 什么都不用做（退出码 0）" % d.reason)
@@ -559,31 +598,56 @@ def promote(a, api, log=print):
     st, doc = api.call("PATCH", "repos/%s/git/refs/heads/%s" % (a.repo, qs(a.branch)),
                        {"sha": a.merge_sha, "force": False})
     result["ref_http_status"] = st
+    # 🚨 **把平台原文原样带上**（`PROJECT.md` §7 坑表 #45 的教训）：
+    #    同一个码 + 两种截然不同的原因 ⇒ 替平台归纳会把人引到错的方向。
+    #    这一条端点上 422 **至少**有两种：非快速前进、以及「你指的那个对象不存在」。
+    detail = json.dumps(doc, ensure_ascii=False)[:600] if doc else "（平台没有给正文）"
     if st == 422:
-        # ⚠️ 这一档**故意**不叫「失败」：它就是「另有人在写这条分支」，
+        # ⚠️ 这一档**故意**不叫「失败」：最常见的原因就是「另有人在写这条分支」，
         #    而 `force=false` 正是拦住它的那道闸 —— 报成运行错误会让人去查工具。
-        raise RaceLost(
-            "PATCH 被平台按**非快速前进**拒掉（HTTP 422）。\n"
-            "   ⇒ 远端 %s 在「读」与「写」之间被推走了，而且不是这次合并的后代。\n"
-            "   ⚠️ **分支没有被覆盖**（`force: false` 的作用），谁也没丢东西。\n"
-            "   最可能的原因：同一时间另有一轮在推这条分支（检测器刚推完上一轮？）。\n"
-            "   ⇒ 什么都不用做：等下一轮检测器按新的 HEAD 重新试合并。" % a.branch,
-            result=result)
+        #    🚨 但**不许替平台归纳**（坑表 #45）：这一条端点上 422 至少有两种原因，
+        #    善后完全相反（「等下一轮」vs「这条路要重新设计」）⇒ 按**原文关键字**分岔，
+        #    并**始终**把原文完整打出来。
+        low = detail.lower()
+        if "fast forward" in low:
+            why = ("⇒ 平台说的是**非快速前进** ⇒ 远端在「读」与「写」之间被推走了，"
+                   "而且不是这次合并的后代。\n"
+                   "   ⚠️ **分支没有被覆盖**（`force: false` 的作用），谁也没丢东西。\n"
+                   "   最可能的原因：同一时间另有一轮在推这条分支（检测器刚推完上一轮？）。\n"
+                   "   ⇒ 什么都不用做：等下一轮检测器按新的 HEAD 重新试合并。")
+        elif "no commit found" in low or "sha" in low and "invalid" in low:
+            why = ("⇒ 平台说的是**那个 sha 它不认**（不是并发）。\n"
+                   "   本通道里合并提交**不在任何 ref 上**，只存在于本地对象库；\n"
+                   "   ⇒ 若平台拒绝接受它，这条路本身要重新设计（#9 的规格要改，不是改参数）。\n"
+                   "   ⇒ **别重试**：先看上面的原文，再决定。")
+        else:
+            why = ("⇒ 平台原文里**没有** `fast forward` 也没有「sha 不认」的字样 ——\n"
+                   "   **不要猜**。这一条端点上 422 至少有两种已知原因，善后相反：\n"
+                   "     ① 非快速前进（并发写）⇒ 等下一轮；\n"
+                   "     ② 服务端不认这个合并提交 ⇒ 这条路要重新设计。\n"
+                   "   先按原文去查，别按「最可能」去改。")
+        result["exit_code"] = EXIT_RACE
+        raise RaceLost("PATCH 被平台拒（HTTP 422）。\n   平台原文：%s\n   %s" % (detail, why),
+                       result=result)
     if st == 403:
-        raise Usage("PATCH 被拒（HTTP 403 `Resource not accessible by integration`）。\n"
+        result["exit_code"] = EXIT_USAGE
+        raise Usage("PATCH 被拒（HTTP 403）。\n"
+                    "   平台原文：%s\n"
                     "   ⇒ 最可能的两个原因：\n"
                     "     ① 调用方的 `permissions:` 里**少了 `contents: write`**\n"
                     "        （⚠️ 一旦写了 `permissions:`，没列出的权限一律变 `none`）；\n"
-                    "     ② 分支保护规则不允许这个 actor 更新（本项目两个 release / 分支都没设保护）。")
+                    "     ② 分支保护规则不允许这个 actor 更新（本项目两个 release / 分支都没设保护）。"
+                    % detail)
     if st == 404:
-        raise Usage("PATCH 返回 404：仓库 %s 或分支 %s 不存在（HTTP 404）。" % (a.repo, a.branch))
+        raise Usage("PATCH 返回 404：仓库 %s 或分支 %s 不存在。\n   平台原文：%s"
+                    % (a.repo, a.branch, detail))
     if st not in (200, 201):
-        raise RuntimeError("PATCH 返回了意外状态 HTTP %d：%s" % (st, json.dumps(doc)[:300]))
+        raise RuntimeError("PATCH 返回了意外状态 HTTP %d：%s" % (st, detail))
     result["pushed"] = True
     log("✅ 已推进 %s → %s（HTTP %d）" % (a.branch, a.merge_sha, st))
 
     # ── ⑥ 推完复核：远端必须**就是**合并提交，并把这次动过的 ref 打出来 ────────
-    after = read_ref(api, a.repo, a.branch, log, quiet=True)
+    after = read_ref(api, a.repo, a.branch)
     result["remote_after"] = after
     if after != a.merge_sha:
         raise RuntimeError(
@@ -597,32 +661,54 @@ def promote(a, api, log=print):
     return result
 
 
-def read_ref(api, repo, branch, log, quiet=False):
+def read_ref(api, repo, branch):
     """读远端分支的 sha；**分支不存在不是错误**（`decide()` 会把它变成一句清楚的话）。"""
     st, doc = api.call("GET", "repos/%s/git/ref/heads/%s" % (repo, qs(branch)))
     if st == 404:
         return None
     if st >= 400:
         raise RuntimeError("读 refs/heads/%s 失败（HTTP %d）：%s"
-                           % (branch, st, json.dumps(doc)[:300]))
+                           % (branch, st, json.dumps(doc, ensure_ascii=False)[:300]))
     return ((doc or {}).get("object") or {}).get("sha")
+
+
+def _remote_line(r):
+    """远端 ref 那一行的措辞。
+
+    ⚠️ **三种情形不是两种**：`read_ref()` 用 `None` 说「分支不存在（404）」、
+    用 sha 说「分支在」、而**键缺失**才说「还没读到」。第一版把前两种都写成
+    「未读到——判据没跑完」，把**已经拿到的信息**（分支不存在）丢掉了。
+    """
+    if "remote_before" not in r:
+        return "（未读到 —— 判据没跑到那一步）"
+    sha = r.get("remote_before")
+    return "`（分支不存在）`" if sha is None else "`%s`" % sha
 
 
 def render_summary(r, mode="ok"):
     """写进 `$GITHUB_STEP_SUMMARY` 的一段。结论要一眼看得见。
 
-    `mode` = `ok`（判据跑完了）/ `error`（判据没跑完，别把它说成「推失败」）。
+    `mode` = `ok`（判据跑完了）/ `error`（判据没跑完，别把它说成「推失败」）/ `race`。
+
+    ⚠️ **每一条「✅」都必须有对应的事实**（独立审查抓到的一处真问题）：
+    第一版拿 `merge_date == upstream_date` 当作「时间锚定 ✅」的判据，
+    而**判据没跑完**那条路把两者都写成 `"?"` ⇒ `"?" == "?"` 为真 ⇒
+    一份**根本没核过**的摘要上打着「（锚定到上游提交的日期 ✅）」。
+    现在改成：两个都**真取到了**才算锚定，否则如实说「未核」。
     """
+    dated = bool(r.get("merge_date")) and bool(r.get("upstream_date"))
+    anchored = dated and r["merge_date"] == r["upstream_date"]
     L = ["## 推进工作分支（issue #9）", "", "| 项 | 值 |", "|---|---|",
          "| 工作分支 | `%s@%s` |" % (r["repo"], r["branch"]),
          "| 合并提交 | `%s` |" % r["merge_sha"],
-         "| 父[0] 本线 | `%s` |" % r["local_sha"],
+         "| 父[0] 本线 | `%s` |" % r["base_sha"],
          "| 父[1] 上游 | `%s` |" % r["upstream_sha"],
-         "| 提交时间 | `%s`%s |" % (r["merge_date"],
-                                    "（锚定到上游提交的日期 ✅）"
-                                    if r.get("merge_date") == r.get("upstream_date")
-                                    else "（上游提交的日期未取到）"),
-         "| 远端（推之前） | `%s` |" % (r["remote_before"] or "（未读到——判据没跑完）")]
+         "| 提交时间 | `%s`%s |" % (
+             r.get("merge_date") or "（未取到）",
+             "（= 上游提交的日期，锚定 ✅）" if anchored
+             else "（上游提交的日期未取到 ⇒ **锚定这一条没核**）" if r.get("merge_date")
+             else "（判据没跑到这一步）"),
+         "| 远端（推之前） | %s |" % _remote_line(r)]
     if r["pushed"]:
         L += ["| 远端（推之后） | `%s` ✅ |" % r["remote_after"],
               "| **结论** | **已推进**（HTTP %s，`force: false`）|" % r["ref_http_status"], "",
@@ -664,7 +750,7 @@ class Args:
         self.branch = kw.get("branch", "work")
         self.repo_dir = kw.get("repo_dir")
         self.merge_sha = kw.get("merge_sha")
-        self.local_sha = kw.get("local_sha")
+        self.base_sha = kw.get("base_sha")
         self.upstream_sha = kw.get("upstream_sha")
         self.dry_run = kw.get("dry_run", False)
         self.run_url = kw.get("run_url", None)
@@ -674,14 +760,17 @@ class FakeApi:
     """假 API：**只认实现真正用到的两个端点**，其余一律抛错。
 
     「多调了一个端点」本身就是实现跑偏的信号，所以这里不给兜底 —— 让它当场炸。
-    `writes` 记下每一次**写**请求：自测断言「被写的 ref 只有工作分支」以及
-    「该拒绝的时候一次写都没发」。
+    `writes` 记下每一次**写**请求：自测断言「被写的 ref **逐字**是工作分支那一条」
+    以及「该拒绝的时候一次写都没发」。
+    ⚠️ `patch_body` 让负向用例能把**平台的原文**放进响应里 ——
+    422 有多种原因，而它们**只能靠 message 分辨**（本工单真踩过）。
     """
 
-    def __init__(self, ref=None, patch_status=200, patch_ref=None):
+    def __init__(self, ref=None, patch_status=200, patch_ref=None, patch_body=None):
         self.ref = ref                     # 远端 refs/heads/<branch> 的值（None = 不存在）
         self.patch_status = patch_status
         self.patch_ref = patch_ref         # 若给：PATCH 之后 ref 变成这个值（复核用）
+        self.patch_body = patch_body or {}
         self.writes = []                   # 每一次写请求的 (method, path, payload)
         self.calls = []
 
@@ -697,7 +786,7 @@ class FakeApi:
             if self.patch_status in (200, 201):
                 self.ref = (payload or {}).get("sha") if self.patch_ref is None else self.patch_ref
                 return self.patch_status, {"object": {"sha": self.ref}}
-            return self.patch_status, {"message": "Update is not a fast forward"}
+            return self.patch_status, self.patch_body
         raise AssertionError("假 API 不认识这个端点：%s %s（实现跑偏了？）" % (method, path))
 
 
@@ -735,7 +824,7 @@ def _init_repo(path):
 
     # ★ 合并提交**由 try-merge.py 本人**造（与 CI 上那条路同一个函数）
     r = tm.run_merge(tm.Args(repo_dir=path, upstream_sha=up, merge_base=a,
-                             work_branch="work", local_sha=work, checkout=True),
+                             work_branch="work", base_sha=work, checkout=True),
                      log=_quiet)
     if r.get("exit_code") != 0:
         raise RuntimeError("夹具：try-merge 没造出合并提交（%r）" % (r,))
@@ -783,10 +872,15 @@ def self_test(tmpdir):
                     problems.append("报错里应出现 %r，实际 %r" % (v, r.get("error")))
             elif r.get(k) != v:
                 problems.append("%s 期望 %r，实际 %r" % (k, v, r.get(k)))
-        # ★ 不变量：被写的 ref **只有**工作分支那一条（一次 PATCH，路径逐字固定）
-        paths = sorted({p for _m, p, _pl in api.writes})
-        if len(paths) > 1:
-            problems.append("写了不止一条 ref：%s" % paths)
+        # ★ 不变量：被写的 ref **只有**工作分支那一条 —— 而且是**逐字**那一条。
+        #   ⚠️ 第一版只断言「至多一条**不同的**路径」，于是 `--branch` 拼歪时
+        #   （正是 `assert_branch` 声称要防的那件事）23 条用例**全绿**：
+        #   假 API 用 `"/git/refs/heads/" in p` 通配任何分支名，
+        #   而推完复核读的又是**同一条**（可能写歪的）分支，会跟着说「✅ 一致」。
+        want_path = "repos/%s/git/refs/heads/%s" % (args.repo, args.branch)
+        wrong = sorted({p for _m, p, _pl in api.writes if p != want_path})
+        if wrong:
+            problems.append("写了别的 ref：%s（应当是 %s）" % (wrong, want_path))
         if want_writes is not None and len(api.writes) != want_writes:
             problems.append("写请求次数应为 %d，实际 %d" % (want_writes, len(api.writes)))
         if problems:
@@ -802,7 +896,7 @@ def self_test(tmpdir):
 
     # ① 正常路径：远端 == 父[0] ⇒ 快速前进
     r1, api1 = case("① 正常：远端 == 父[0] ⇒ 推进", EXIT_OK,
-                    Args(repo_dir=d, merge_sha=msha, local_sha=work, upstream_sha=up),
+                    Args(repo_dir=d, merge_sha=msha, base_sha=work, upstream_sha=up),
                     FakeApi(ref=work), decision="push", pushed=True,
                     remote_after=msha, _writes=1)
     n[0] += 1
@@ -815,35 +909,59 @@ def self_test(tmpdir):
 
     # ② 幂等：远端已经是合并提交 ⇒ 什么都不做（**一次写都不发**）
     case("② 幂等：远端已是合并提交 ⇒ 不写", EXIT_OK,
-         Args(repo_dir=d, merge_sha=msha, local_sha=work, upstream_sha=up),
+         Args(repo_dir=d, merge_sha=msha, base_sha=work, upstream_sha=up),
          FakeApi(ref=msha), decision="already", pushed=False, _writes=0)
 
     # ③ 分支上有别的东西 ⇒ 让路（退出码 3），**一次写都不发**
     case("③ 分支已前进 ⇒ 让路（3），不发写请求", EXIT_REF_MOVED,
-         Args(repo_dir=d, merge_sha=msha, local_sha=work, upstream_sha=up),
+         Args(repo_dir=d, merge_sha=msha, base_sha=work, upstream_sha=up),
          FakeApi(ref="f" * 40), decision="moved", pushed=False, _writes=0)
 
     # ④ 并发被抢：读完 ref 之后远端被推走 ⇒ 平台按非快速前进拒（422 ⇒ 退出码 4）。
     #    ⚠️ 这一条正是验收第 4 条（「检测器与构建器不会同时写同一条工作分支」）的落地，
     #    而它**只有真发一次 PATCH 才测得出来** —— 假 API 在这里扮演平台。
-    case("④ 并发被抢 ⇒ 平台拒（422 ⇒ 4），分支没被覆盖", EXIT_RACE,
-         Args(repo_dir=d, merge_sha=msha, local_sha=work, upstream_sha=up),
-         FakeApi(ref=work, patch_status=422), decision="push", pushed=False, _writes=1,
-         exc="非快速前进")
+    r4, api4 = case("④ 并发被抢 ⇒ 平台拒（422 ⇒ 4），分支没被覆盖", EXIT_RACE,
+                    Args(repo_dir=d, merge_sha=msha, base_sha=work, upstream_sha=up),
+                    FakeApi(ref=work, patch_status=422,
+                            patch_body={"message": "Update is not a fast forward"}),
+                    decision="push", pushed=False, _writes=1,
+                    exc="平台原文")
+    n[0] += 1
+    if r4 and r4.get("exit_code") == EXIT_RACE:
+        print("  ✅ #%-2d %-46s -> exit_code=%d（与进程退出码一致）"
+              % (n[0], "④ 附属：result 里的 exit_code 不许是 0", r4["exit_code"]))
+    else:
+        fail("④ 附属：result 里的 exit_code 应当是 4（第一版是 0）",
+             (r4 or {}).get("exit_code"))
+    n[0] += 1
+    if api4 and api4.writes and "Update is not a fast forward" in (
+            (r4 or {}).get("error") or ""):
+        print("  ✅ #%-2d %-46s -> 原文被原样带出来了" % (n[0], "④ 附属：422 要把平台原文打出来"))
+    else:
+        fail("④ 附属：422 的报错必须包含平台原文",
+             (r4 or {}).get("error"))
+
+    # ④b 422 的**另一种**原因（对象不存在）⇒ 报错要提醒「别重试，先看原文」。
+    #     同一个码两种原因、善后相反 —— 这正是「必须把原文打出来」那条教训的落点。
+    case("④b 422 说「sha 无效」⇒ 报错要区分，不许一律说「被抢」", EXIT_RACE,
+         Args(repo_dir=d, merge_sha=msha, base_sha=work, upstream_sha=up),
+         FakeApi(ref=work, patch_status=422,
+                 patch_body={"message": "Invalid request.\n\nNo commit found for SHA"}),
+         decision="push", pushed=False, _writes=1, exc="别重试")
 
     # ⑤ 分支不存在 ⇒ **用法错误**（2），不是「让路」—— 这两件事善后完全不同
     case("⑤ 分支不存在 ⇒ 用法错误（2）", EXIT_USAGE,
-         Args(repo_dir=d, merge_sha=msha, local_sha=work, upstream_sha=up),
+         Args(repo_dir=d, merge_sha=msha, base_sha=work, upstream_sha=up),
          FakeApi(ref=None), _writes=0, exc="没有这条分支")
 
     # ⑥ 父[1] 不是那个上游提交 ⇒ 一个请求都不发
     case("⑥ 父[1] ≠ --upstream-sha ⇒ 不发请求", EXIT_USAGE,
-         Args(repo_dir=d, merge_sha=msha, local_sha=work, upstream_sha="a" * 40),
+         Args(repo_dir=d, merge_sha=msha, base_sha=work, upstream_sha="a" * 40),
          FakeApi(ref=work), _writes=0, exc="父[1]")
 
-    # ⑦ 父[0] 不是 --local-sha ⇒ 一个请求都不发
-    case("⑦ 父[0] ≠ --local-sha ⇒ 不发请求", EXIT_USAGE,
-         Args(repo_dir=d, merge_sha=msha, local_sha="b" * 40, upstream_sha=up),
+    # ⑦ 父[0] 不是 --base-sha ⇒ 一个请求都不发
+    case("⑦ 父[0] ≠ --base-sha ⇒ 不发请求", EXIT_USAGE,
+         Args(repo_dir=d, merge_sha=msha, base_sha="b" * 40, upstream_sha=up),
          FakeApi(ref=work), _writes=0, exc="父[0]")
 
     # ⑧ detached HEAD 也要能跑 —— **这是 CI 的真实形态**：repro job 的
@@ -851,7 +969,7 @@ def self_test(tmpdir):
     #    （第一版在这里加了「必须检出在 --branch 上」的守卫，于是 CI 上必然失败。）
     git(d, "checkout", "-q", "--detach", msha)
     case("⑧ detached HEAD（CI 的真实形态）⇒ 照常推进", EXIT_OK,
-         Args(repo_dir=d, merge_sha=msha, local_sha=work, upstream_sha=up),
+         Args(repo_dir=d, merge_sha=msha, base_sha=work, upstream_sha=up),
          FakeApi(ref=work), decision="push", pushed=True, _writes=1)
     git(d, "checkout", "-q", "work")
 
@@ -860,7 +978,7 @@ def self_test(tmpdir):
                      ("⑨b --branch 含 .. ⇒ 拒绝", "../work")):
         n[0] += 1
         try:
-            promote(Args(repo_dir=d, branch=br, merge_sha=msha, local_sha=work,
+            promote(Args(repo_dir=d, branch=br, merge_sha=msha, base_sha=work,
                          upstream_sha=up), FakeApi(ref=work), log=_quiet)
             fail(what, "没拒绝")
         except Usage as e:
@@ -868,13 +986,13 @@ def self_test(tmpdir):
 
     # ⑩ --dry-run：判据跑完，但**一次写都不发**
     case("⑩ --dry-run ⇒ 判据跑完、不写", EXIT_OK,
-         Args(repo_dir=d, merge_sha=msha, local_sha=work, upstream_sha=up, dry_run=True),
+         Args(repo_dir=d, merge_sha=msha, base_sha=work, upstream_sha=up, dry_run=True),
          FakeApi(ref=work), decision="dry_run", pushed=False, dry_run=True, _writes=0)
 
     # ⑪ 缩写 sha ⇒ 拒绝（形状守卫）
     n[0] += 1
     try:
-        promote(Args(repo_dir=d, merge_sha=msha[:12], local_sha=work, upstream_sha=up),
+        promote(Args(repo_dir=d, merge_sha=msha[:12], base_sha=work, upstream_sha=up),
                 FakeApi(ref=work), log=_quiet)
         fail("⑪ 缩写 sha ⇒ 拒绝", "没拒绝")
     except Usage as e:
@@ -883,7 +1001,7 @@ def self_test(tmpdir):
 
     # ⑫ 合并提交本地没有 ⇒ 明确报「取不到它、去重放那次合并」，**不是**崩在 git 上
     case("⑫ 合并提交不在本地 ⇒ 用法错误，不写", EXIT_USAGE,
-         Args(repo_dir=d, merge_sha="c" * 40, local_sha=work, upstream_sha=up),
+         Args(repo_dir=d, merge_sha="c" * 40, base_sha=work, upstream_sha=up),
          FakeApi(ref=work), _writes=0, exc="不在本地对象库里")
 
     # ⑫b 上游提交不在本地 ⇒ 时间锚定**降级为「只记不核」**、仍可推进。
@@ -892,7 +1010,7 @@ def self_test(tmpdir):
     #     所以这一条只钉住「`upstream_date` 缺失时摘要怎么说」，而不是假装能构造它。
     n[0] += 1
     txt = render_summary({"repo": "o/r", "branch": "work", "merge_sha": "m" * 40,
-                          "local_sha": "l" * 40, "upstream_sha": "u" * 40,
+                          "base_sha": "b" * 40, "upstream_sha": "u" * 40,
                           "merge_date": "2026-09-27T03:22:34+08:00", "upstream_date": None,
                           "remote_before": "l" * 40, "remote_after": "m" * 40,
                           "decision": "push", "exit_code": 0, "reason": "", "pushed": True,
@@ -901,6 +1019,34 @@ def self_test(tmpdir):
         print("  ✅ #%-2d %-46s -> 降级说明与结论都在" % (n[0], "⑫b 锚定核不了 ⇒ 摘要明说"))
     else:
         fail("⑫b 摘要应明说「上游提交的日期未取到」", txt)
+
+    # ⑫c **判据没跑完**时的摘要不许打任何 ✅（独立审查抓到的一处真问题）：
+    #     第一版把 merge_date / upstream_date 都写死成 `"?"` ⇒ `"?" == "?"` 为真 ⇒
+    #     一份**根本没核过**的摘要上写着「锚定到上游提交的日期 ✅」。
+    #     夹具直接喂 `_fallback_result()` 的产物，正是那条路径真实的形状。
+    n[0] += 1
+    fa = Args(repo_dir=d, merge_sha=msha, base_sha=work, upstream_sha=up)
+    for what, fallback in (("Usage", _fallback_result(fa, EXIT_USAGE)),
+                           ("运行错误", _fallback_result(fa, EXIT_RUN))):
+        txt = render_summary(fallback, mode="error")
+        bad_bits = [b for b in ("锚定 ✅", "✅ **已推进**", "上游提交的日期") if b in txt]
+        if "✅" in txt or "锚定 ✅" in txt:
+            fail("⑫c %s 的摘要不该出现 ✅" % what, [l for l in txt.splitlines() if "✅" in l])
+        elif "未取到" not in txt:
+            fail("⑫c %s 的摘要该明说时间未取到" % what, bad_bits)
+        else:
+            print("  ✅ #%-2d %-46s -> 摘要里没有 ✅，如实说「未取到」"
+                  % (n[0], "⑫c %s 路径的摘要不说谎" % what))
+        n[0] += 1
+    # ⑫d `exit_code` 必须与**进程**一致：第一版在运行错误那条路上硬编码成 2。
+    n[0] += 1
+    codes = (_fallback_result(fa, EXIT_USAGE)["exit_code"],
+             _fallback_result(fa, EXIT_RUN)["exit_code"])
+    if codes == (EXIT_USAGE, EXIT_RUN):
+        n[0] -= 1
+        print("  ✅ #%-2d %-46s -> %s" % (n[0], "⑫d 两条出错路径的 exit_code", codes))
+    else:
+        fail("⑫d 出错路径的 exit_code 应是 (2, 1)", codes)
 
     # ⑬ 决定性：同一对输入算出来的父[0] 逐字等于本线 HEAD（`setlocalversion` 靠它）
     n[0] += 1
@@ -948,24 +1094,33 @@ def _quiet(*_a, **_kw):
     pass
 
 
-def _fallback_result(a, decision):
+def _fallback_result(a, exit_code):
     """出错路径上的**薄结果**：够 `render_summary()` 与 `--json-out` 用。
 
     ⚠️ 为什么不干脆不写摘要：这条通道的摘要**就是**人唯一会看的东西
     （`detect.yml` 的同款理由）。一次「没推成」的运行如果摘要空白，
     读的人只会看到「红的/绿的」而不知道**为什么**。
+
+    ⚠️ **`remote_before` 这个键在这里故意不出现**：那表示「还没读到」，
+    与「读到了、分支不存在」（值是 `None`）是两件事（见 `_remote_line`）。
+    ⚠️ `exit_code` 由调用方给：第一版硬编码成 `EXIT_USAGE`，
+    于是「工具崩了」（1）在机器可读出口里写成「用法错误」（2）。
     """
     return {"repo": a.repo, "branch": a.branch, "merge_sha": a.merge_sha,
-            "local_sha": a.local_sha, "upstream_sha": a.upstream_sha,
-            "merge_date": "?", "upstream_date": "?", "remote_before": None,
-            "remote_after": None, "decision": decision, "exit_code": EXIT_USAGE,
+            "base_sha": a.base_sha, "upstream_sha": a.upstream_sha,
+            "merge_date": None, "upstream_date": None,
+            "remote_after": None, "decision": None, "exit_code": exit_code,
             "reason": "", "pushed": False,
             "dry_run": bool(a.dry_run), "run_url": a.run_url,
             "ref_http_status": None}
 
 
 def _emit(a, r, mode="ok"):
-    """把结果落到 `--json-out` / `--github-output` / `--summary`（三条路共用一份形状）。
+    """把结果落到 `--json-out` / `--summary`（两条路共用一份形状）。
+
+    ⚠️ **没有 `--github-output`**：那是「只写不读」——`promote.py` 的 outputs
+    在两个 workflow 里都没有消费者（独立审查抓到）。本仓库对「只写不读」点过两次，
+    所以这一版直接不提供它；`promote.json`（`--json-out`）是给人看的诊断材料。
 
     `mode` 只影响摘要里结论行怎么措辞：`error` 那一档要说清「**不是**推失败，
     是判据没跑完」—— 两者善后完全不同（一个去查前置条件，一个去查平台/并发）。
@@ -974,22 +1129,17 @@ def _emit(a, r, mode="ok"):
         with open(a.json_out, "w", encoding="utf-8", newline="\n") as f:
             json.dump(r, f, ensure_ascii=False, indent=2, sort_keys=True)
             f.write("\n")
-    if a.github_output:
-        with open(a.github_output, "a", encoding="utf-8", newline="\n") as f:
-            for k in ("exit_code", "decision", "pushed", "branch", "merge_sha", "local_sha",
-                      "upstream_sha", "remote_before", "remote_after", "merge_date", "dry_run"):
-                f.write("%s=%s\n" % (k, r.get(k) if r.get(k) is not None else ""))
     if a.summary:
         with open(a.summary, "a", encoding="utf-8", newline="\n") as f:
             f.write(render_summary(r, mode=mode))
 
 
 def main(argv):
-    if hasattr(sys.stdout, "reconfigure"):
-        # ⚠️ `line_buffering=True` 不是好看：本脚本**派生子进程**（git），子进程直接写 fd 1，
-        #    而父进程的 stdout 在 CI 里是管道 ⇒ 默认块缓冲会让日志读起来像时间倒流
-        #    （`PROJECT.md` §7 坑表 #33）。
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    # 编码已由**模块级**那次 reconfigure 处理（见文件头附近那段注释）——
+    # 这里**不再**设 `line_buffering=True`：本文件不派生子进程抢 fd 1
+    # （所有 git 调用走 `run()`，它们的 stdout/stderr 被重定向到临时文件），
+    # 而模块级已经设过一次了。⚠️ 第一版在这里又设了一次、理由写的还是「子进程写 fd 1」，
+    # 与模块级那句注释**互相矛盾**，两句里必有一句在骗读的人（独立审查抓到）。
     ap = argparse.ArgumentParser(
         add_help=True, description="全绿才推分支：把那次试合并推进工作分支（见文件头）",
         epilog="退出码：0 已推进（或幂等）/ 3 分支已前进（这次不推）/ 4 并发被抢 / "
@@ -998,15 +1148,14 @@ def main(argv):
     ap.add_argument("--branch", metavar="分支", help="**工作分支**（全工具唯一会写的那条 ref）")
     ap.add_argument("--repo-dir", default=".", help="本地检出的仓库（默认当前目录）")
     ap.add_argument("--merge-sha", metavar="SHA", help="要推上去的合并提交（40 位）")
-    ap.add_argument("--local-sha", metavar="SHA",
+    ap.add_argument("--base-sha", metavar="SHA",
                     help="试合并时的本线 HEAD —— 必须等于合并提交的**父[0]**")
     ap.add_argument("--upstream-sha", metavar="SHA",
                     help="试合并合进来的上游提交 —— 必须等于合并提交的**父[1]**")
     ap.add_argument("--run-url", metavar="URL", help="写进运行摘要（事后追溯）")
     ap.add_argument("--dry-run", action="store_true",
                     help="跑完全部判据但**不发写请求**（本机只读演练）")
-    ap.add_argument("--json-out", metavar="文件", help="把结果写一份 JSON")
-    ap.add_argument("--github-output", metavar="文件", help="写 `key=value`（喂 $GITHUB_OUTPUT）")
+    ap.add_argument("--json-out", metavar="文件", help="把结果写一份 JSON（诊断材料）")
     ap.add_argument("--summary", metavar="文件", help="追加一段 Markdown（喂 $GITHUB_STEP_SUMMARY）")
     ap.add_argument("--self-test", action="store_true", help="离线跑内置用例（不联网）")
     ap.add_argument("--self-test-dir", metavar="目录")
@@ -1018,7 +1167,7 @@ def main(argv):
             shutil.rmtree(d, ignore_errors=True)
         return 1 if self_test(d) else 0
 
-    missing = [n for n in ("repo", "branch", "merge_sha", "local_sha", "upstream_sha")
+    missing = [n for n in ("repo", "branch", "merge_sha", "base_sha", "upstream_sha")
                if not getattr(a, n)]
     if missing:
         print("缺必填参数: %s" % " / ".join("--" + m.replace("_", "-") for m in missing))
@@ -1038,15 +1187,15 @@ def main(argv):
         r = promote(a, api, log=print)
     except Usage as e:
         print("❌ 用法 / 前置错误：%s" % e)
-        _emit(a, _fallback_result(a, "usage"), "error")
+        _emit(a, _fallback_result(a, EXIT_USAGE), "error")
         return EXIT_USAGE
     except RefMoved as e:
         print("⚠️ %s" % e)
-        _emit(a, e.result or _fallback_result(a, "moved"), "moved")
+        _emit(a, e.result or _fallback_result(a, EXIT_REF_MOVED), "moved")
         return EXIT_REF_MOVED
     except RaceLost as e:
         print("⚠️ %s" % e)
-        _emit(a, e.result or _fallback_result(a, "race"), "race")
+        _emit(a, e.result or _fallback_result(a, EXIT_RACE), "race")
         return EXIT_RACE
     except Exception as e:
         # ⚠️ 非预期异常**连栈一起打**：这一层本来是给「git 失败 / 网络失败」用的，
@@ -1054,7 +1203,7 @@ def main(argv):
         import traceback
         traceback.print_exc()
         print("❌ 运行错误：%s" % _redact(e))
-        _emit(a, _fallback_result(a, "error"), "error")
+        _emit(a, _fallback_result(a, EXIT_RUN), "error")
         return EXIT_RUN
 
     print()
