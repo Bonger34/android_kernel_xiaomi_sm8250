@@ -511,7 +511,7 @@ def run(a, api, log=print, dm=None, today=None):
          "state_path": a.state_path, "today": today.isoformat(),
          "dry_run": bool(a.dry_run), "expire_days": sc.EXPIRE_DAYS,
          "marker": None, "marker_changed": False, "marker_note": None,
-         "issue": None, "issue_action": None, "issue_comment_url": None,
+         "issue": None, "issue_action": None,
          "artifacts": [], "verdict": None, "reason": None, "exit_code": EXIT_OK}
 
     # ── ① 判定：**从 job 列表来**（理由见文件头：run 级的结论这一刻还不存在）──────────
@@ -575,7 +575,7 @@ def run(a, api, log=print, dm=None, today=None):
 
     if a.dry_run:
         r["marker_line"] = "**没写**（--dry-run）"
-        r["issue_line"] = ("会追加评论到 #%d" % r["issue"]) if existing else "会新建一个 issue"
+        r["issue_line"] = ("追加评论到 #%d" % r["issue"]) if existing else "新建一个 issue"
         log("")
         log("⚠️ --dry-run：上面是完整判据，**一条写请求都没发**。")
         log("    将会 %s；%s"
