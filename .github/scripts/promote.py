@@ -560,6 +560,32 @@ def promote(a, api, log=print):
                lambda x, y: git(a.repo_dir, "merge-base", "--is-ancestor", x, y,
                                 check=False)[0] == 0)
     log("  远端 %s = %s" % (a.branch, remote or "（不存在）"))
+
+    # ── ④b 种子投放复核（`--staging-ref`；给了就核）────────────────────────────
+    #    🚨 **这一步不是可选的装饰**（2026-09-27 实测）：合并提交是 runner 上
+    #    `git commit-tree` 造出来的、不在任何 ref 上 ⇒ **服务端没有这个对象**
+    #    ⇒ `PATCH ref` 回 `{"message": "Object does not exist"}`。
+    #    检测器把它推到一条**临时 ref** 之后它才成为服务端对象。
+    #    ⚠️ 在这里先核一遍，能把「那一步失败」从**看不懂的 422** 变成一句**说清原因的话**；
+    #    顺序也重要：它必须排在「决定要推」**之前**。
+    #    ⚠️ 它**不写 `result`**（那本字典在下面才构造）—— 种子值由调用方从这儿
+    #    自己取（`staging_sha` 只是把它带进日志与摘要）。
+    staging_sha = None
+    if a.staging_ref:
+        a.staging_ref = assert_branch(a.staging_ref)
+        staging_sha = read_ref(api, a.repo, a.staging_ref)
+        log("  种子 ref   %s = %s" % (a.staging_ref, staging_sha or "（不存在）"))
+        if staging_sha != a.merge_sha:
+            raise Usage(
+                "临时 ref `%s` 指向 %s，而不是这次要推的合并提交 %s。\n"
+                "   ⇒ **没有种子投放，服务端不认那个提交** —— 现在推，平台会回\n"
+                "     `{\"message\": \"Object does not exist\"}`（run 36311829440 实测）。\n"
+                "   最可能的原因（按可能性排序）：\n"
+                "     ① 检测器那一步**没跑**或失败了（种子投放是 #9 新增的一步）；\n"
+                "     ② 期间又跑了一轮检测器，把这条临时 ref **覆盖**成了它那次的合并提交\n"
+                "        ⇒ 本轮的合并提交已经不再被任何 ref 引用（它会随 GC 消失）。\n"
+                "   ⇒ **别重试**：等下一轮检测器按新的 HEAD 重新试合并。"
+                % (a.staging_ref, staging_sha or "（不存在）", a.merge_sha[:12]))
     result = {
         "repo": a.repo, "branch": a.branch, "merge_sha": a.merge_sha,
         "base_sha": a.base_sha, "upstream_sha": a.upstream_sha,
@@ -568,6 +594,7 @@ def promote(a, api, log=print):
         "decision": d.kind, "exit_code": d.exit_code, "reason": d.reason,
         "pushed": False, "dry_run": bool(a.dry_run),
         "run_url": a.run_url, "ref_http_status": None, "files": None,
+        "staging_ref": a.staging_ref, "staging_sha": staging_sha,
     }
     if d.kind == "moved":
         log("❌ %s" % d.reason)
@@ -752,6 +779,7 @@ class Args:
         self.merge_sha = kw.get("merge_sha")
         self.base_sha = kw.get("base_sha")
         self.upstream_sha = kw.get("upstream_sha")
+        self.staging_ref = kw.get("staging_ref")
         self.dry_run = kw.get("dry_run", False)
         self.run_url = kw.get("run_url", None)
 
@@ -762,12 +790,17 @@ class FakeApi:
     「多调了一个端点」本身就是实现跑偏的信号，所以这里不给兜底 —— 让它当场炸。
     `writes` 记下每一次**写**请求：自测断言「被写的 ref **逐字**是工作分支那一条」
     以及「该拒绝的时候一次写都没发」。
+    ⚠️ `refs` 是**其它** ref（种子投放用的临时 ref）—— 与 `ref`（工作分支）分开，
+    因为实现要用 `--staging-ref` 读它、而读的**不是**工作分支。
     ⚠️ `patch_body` 让负向用例能把**平台的原文**放进响应里 ——
     422 有多种原因，而它们**只能靠 message 分辨**（本工单真踩过）。
     """
 
-    def __init__(self, ref=None, patch_status=200, patch_ref=None, patch_body=None):
-        self.ref = ref                     # 远端 refs/heads/<branch> 的值（None = 不存在）
+    def __init__(self, ref=None, patch_status=200, patch_ref=None, patch_body=None,
+                 refs=None, work_branch="work"):
+        self.ref = ref                     # 工作分支 refs/heads/<work_branch> 的值（None = 不存在）
+        self.refs = refs or {}             # 其它 ref（如种子投放用的临时 ref）
+        self.work_branch = work_branch
         self.patch_status = patch_status
         self.patch_ref = patch_ref         # 若给：PATCH 之后 ref 变成这个值（复核用）
         self.patch_body = patch_body or {}
@@ -778,9 +811,14 @@ class FakeApi:
         p = path.split("?")[0]
         self.calls.append("%s %s" % (method, p))
         if method == "GET" and "/git/ref/heads/" in p:
-            if self.ref is None:
-                return 404, {"message": "Not Found"}
-            return 200, {"ref": "refs/heads/" + p.rsplit("/", 1)[1], "object": {"sha": self.ref}}
+            name = p.rsplit("/", 1)[1]
+            if name == self.work_branch:
+                if self.ref is None:
+                    return 404, {"message": "Not Found"}
+                return 200, {"ref": "refs/heads/" + name, "object": {"sha": self.ref}}
+            if name in self.refs:
+                return 200, {"ref": "refs/heads/" + name, "object": {"sha": self.refs[name]}}
+            return 404, {"message": "Not Found"}
         if method == "PATCH" and "/git/refs/heads/" in p:
             self.writes.append((method, p, payload))
             if self.patch_status in (200, 201):
@@ -1048,6 +1086,24 @@ def self_test(tmpdir):
     else:
         fail("⑫d 出错路径的 exit_code 应是 (2, 1)", codes)
 
+    # ⑯ `--staging-ref`：**种子投放**的复核 —— 服务端认那个提交的前提。
+    #     这一条的负向是**本工单真踩过的那个 422**（`Object does not exist`）：
+    #     检测器没投放种子时，必须在**发出写请求之前**就说清楚，而不是等平台回一句看不懂的话。
+    case("⑯ 临时 ref == 合并提交 ⇒ 照常推进", EXIT_OK,
+         Args(repo_dir=d, merge_sha=msha, base_sha=work, upstream_sha=up,
+              staging_ref="sync-staging"),
+         FakeApi(ref=work, refs={"sync-staging": msha}), decision="push", pushed=True,
+         staging_sha=msha, _writes=1)
+    case("⑯b 临时 ref 指向别处 ⇒ 用法错误，**一个写请求都不发**", EXIT_USAGE,
+         Args(repo_dir=d, merge_sha=msha, base_sha=work, upstream_sha=up,
+              staging_ref="sync-staging"),
+         FakeApi(ref=work, refs={"sync-staging": "f" * 40}), _writes=0,
+         exc="Object does not exist")
+    case("⑯c 临时 ref 不存在 ⇒ 同上", EXIT_USAGE,
+         Args(repo_dir=d, merge_sha=msha, base_sha=work, upstream_sha=up,
+              staging_ref="sync-staging"),
+         FakeApi(ref=work), _writes=0, exc="种子投放")
+
     # ⑬ 决定性：同一对输入算出来的父[0] 逐字等于本线 HEAD（`setlocalversion` 靠它）
     n[0] += 1
     if first_parent == work:
@@ -1152,6 +1208,10 @@ def main(argv):
                     help="试合并时的本线 HEAD —— 必须等于合并提交的**父[0]**")
     ap.add_argument("--upstream-sha", metavar="SHA",
                     help="试合并合进来的上游提交 —— 必须等于合并提交的**父[1]**")
+    ap.add_argument("--staging-ref", metavar="分支",
+                    help="**种子投放用的临时 ref**（检测器把合并提交推到那儿，服务端才认它）。"
+                         "给了就核「它 == 合并提交」，不等则**一个请求都不发** —— "
+                         "少了这一步，平台会在 PATCH 时回一句看不懂的 `Object does not exist`")
     ap.add_argument("--run-url", metavar="URL", help="写进运行摘要（事后追溯）")
     ap.add_argument("--dry-run", action="store_true",
                     help="跑完全部判据但**不发写请求**（本机只读演练）")
