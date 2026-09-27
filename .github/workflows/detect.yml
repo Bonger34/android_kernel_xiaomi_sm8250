@@ -113,6 +113,18 @@ jobs:
   detect:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    # ⚠️ 这四个值**必须在 job 级导出**：失败上报自 #17 起是**独立 job**，
+    #    而 job 之间只能通过 `outputs` 传值（`build.yml` 那边不需要，因为它的值来自
+    #    `inputs` —— 检测器没有那个来源）。
+    #
+    # ⚠️ **失败的 job 照样导出 outputs**（只要写它的那一步跑到了）。这正是本改动能成立的前提：
+    #    试合并冲突时，`detect` 那一步早已跑完 ⇒ 这三个 sha 拿得到。
+    #    而底包那一步在冲突时**根本不会跑** ⇒ `base_sha256` 为空，工具按「如实留空」处理。
+    outputs:
+      upstream_sha: ${{ steps.detect.outputs.upstream_sha }}
+      merge_base: ${{ steps.detect.outputs.merge_base }}
+      merge_sha: ${{ steps.merge.outputs.merge_sha }}
+      base_sha256: ${{ steps.base.outputs.base_sha256 }}
     steps:
       # ⚠️ `ref:` 显式钉住工作分支：本工作流可以被手动派发到**任何** ref 上
       #    （「检测器被停用时恢复只要点几下」那条验收），而我们要跑的永远是跟随分支上那份
@@ -344,6 +356,7 @@ jobs:
             >> "$GITHUB_STEP_SUMMARY"
 
       - name: "取底包：**整条通道只取一次**，两个 build job 共用这一份"
+        id: base
         if: steps.detect.outputs.state == 'drifted' && github.event.inputs.dry_run != 'true'
         run: |
           set -euo pipefail
@@ -358,6 +371,9 @@ jobs:
             echo "   实际 $BSHA"; sed -n '1,20p' base-fetch.log; exit 1
           fi
           echo "  ✅ 与取底包那一步记的那一行一致"
+          # ⚠️ 导出到 job 级（#17）：失败上报是**独立 job**，只能靠 outputs 拿到这个值。
+          #    放在校验**之后**：没通过校验的 sha 不该被传给别人。
+          echo "base_sha256=$BSHA" >> "$GITHUB_OUTPUT"
           # ⚠️ 期次要跟着底包一起传下去：build 那边复用这份 artifact 时会把
           #    `base-fetch.log` **整份重写**（来源写成 `artifact:<run>/<name>`），
           #    期次不单独传就会只剩「（未钉期次）」—— 来源说明里那条记录就没了。
@@ -449,38 +465,72 @@ jobs:
             echo "✅ \`$WORK_BRANCH\` 从头到尾是 \`$NOW\` —— 检测器**一个字节都没推**。"
             echo "（推分支是构建器在全绿之后做的：issue #9。）"; } >> "$GITHUB_STEP_SUMMARY"
 
-      # ══ #10：红了叫人 ═════════════════════════════════════════════════════════
-      # **检测器自身失败也要叫人。** 最常见的形态是**试合并冲突**（fixture `sync-conflict-sim`
-      # 那一次的 run 36270791644 就是：红的，而**没有任何人被叫** —— 那正是 #10 的活）。
-      #
-      # 为什么这一档比构建失败**更**需要自动通知：冲突**不会自己消失**，而检测器每天跑一次
-      # ⇒ 没有这一步就变成「同一个上游提交每天都红一次」，直到有人碰巧打开 Actions 页面。
-      # 记下失败标记之后，7 天内不再为它重复跑（过期后自动重试）。
-      #
-      # ⚠️ 与构建器那条路的**唯一**区别：这里没有产物（检测器不编译），
-      #    issue 正文会如实写「这次没有产物」。其余完全相同：同一个工具、同一份标记、同一套去重。
-      #
-      # ⚠️ `--upstream-sha` 取自**检测那一步**的输出：若失败发生在检测那一步**本身**
-      #    （例如 API 抖动 / 限流），它是空的 ⇒ 工具判 `no-upstream` 并**什么都不做**。
-      #    那是有意的：一次网络抖动不该开 issue，也不该让某个提交被拉黑 7 天
-      #    （规格实现决定 7：基础设施抖动会自动重试）。
-      - name: "红了叫人：检测器自身失败也开 issue（冲突无法自愈，#10）"
-        if: failure()
+  # ══ #10 + #17：红了叫人（**独立 job**）═══════════════════════════════════════
+  # **检测器自身失败也要叫人。** 最常见的形态是**试合并冲突**（夹具 `sync-conflict-sim`
+  # 那一次的 run 36270791644 就是：红的，而**没有任何人被叫** —— 那正是 #10 的活）。
+  #
+  # 为什么这一档比构建失败**更**需要自动通知：冲突**不会自己消失**，而检测器每天跑一次
+  # ⇒ 没有这一步就变成「同一个上游提交每天都红一次」，直到有人碰巧打开 Actions 页面。
+  # 记下失败标记之后，7 天内不再为它重复跑（过期后自动重试）。
+  #
+  # 🚨 **#17：它原先写在 `detect` job 的末尾（一步 `if: failure()`），那样根本不会生效。**
+  #    真跑证据（run 36339159328，冲突夹具）：run 与 job 的结论都是 `failure`，
+  #    而那一报告 `success`、`verdict = no-failure` —— **静默地什么都没做**。
+  #    根因：`classify()` 对「自己这个 job 还在跑」是有分支的（只看**已结束且结论为 failure**
+  #    的步骤），但它读的是 `GET /actions/runs/<id>/jobs`，而**平台对步骤结论的回声有延迟**：
+  #      18:03:31.304  试合并失败
+  #      18:03:31.310  上报那一步启动        ← 相隔 6 毫秒
+  #      18:03:31.82   读 API ⇒ 失败还没回声出来 ⇒ `failures = []` ⇒ 判 `no-failure`
+  #    ⇒ 修法就是本 job：**独立 job 天然在 `detect` 结束之后才启动**，
+  #      那时 API 早已回声完毕（`build.yml` 的 `notify` 一直是这么写的，所以它没这个毛病）。
+  #
+  # ⚠️ 与构建器那条路的**唯一**区别：这里没有产物（检测器不编译），
+  #    issue 正文会如实写「这次没有产物」。其余完全相同：同一个工具、同一份标记、同一套去重。
+  #
+  # ⚠️ 值只能从 `needs.detect.outputs.*` 拿（检测器没有 `inputs` 那个来源）。
+  #    **失败的 job 照样导出 outputs** —— 见上面 `detect` job 的 `outputs:` 注。
+  #
+  # ⚠️ `--upstream-sha` 可能是空的：若失败发生在**检测那一步本身**（例如 API 抖动 / 限流），
+  #    `steps.detect.outputs.upstream_sha` 就没写出来 ⇒ 工具判 `no-upstream` 并**什么都不做**。
+  #    那是有意的：一次网络抖动不该开 issue，也不该让某个提交被拉黑 7 天
+  #    （规格实现决定 7：基础设施抖动会自动重试）。
+  notify:
+    needs: [detect]
+    # ⚠️ 用 `failure()` 而不是 `always()`：实测（坑表 #48）取消时 `always()` 的 job
+    #    **照样会被启动**，而 `failure()` + `needs` 的那一个**不会** —— 后者正是我们要的。
+    if: failure()
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    # ⚠️ **一旦写了 `permissions:`，没列出的权限一律变 `none`。**
+    #    这里三个都必须显式列出：`contents: write` 写失败标记；`issues: write` 开 issue；
+    #    `actions: read` 读本 run 的 job 列表（工具靠 job 级结论判定）。
+    #    ⚠️ 别以为工作流级的 `actions: write` 还会留着 —— job 级一写就把它抹成 `none`。
+    permissions:
+      contents: write
+      issues: write
+      actions: read
+    steps:
+      # 只为了把 `.github/scripts/report-failure.py` 拿到手；不碰工作分支（不推、不改）。
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.WORK_BRANCH }}
+          fetch-depth: 1
+
+      - name: "失败上报：开 issue + 记下这个上游提交（#10 / #17）"
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # ⚠️ **不传 `--self-job`**：它的默认值就是 `GITHUB_JOB`（= 本 job 的 id），
-          #    在这里再写一遍就是同一个事实两处各记一份（漂移后果是静默的，见 build.yml 的同款注释）。
-          # `--base-sha256` 用 `|| true` 兜底：底包是**后面**那一步才取的，
-          # 试合并冲突时这份文件根本不存在 —— 那种情形下这一栏如实留空。
+          # ⚠️ **不传 `--self-job`**：它的默认值就是 `GITHUB_JOB`（= `notify`），
+          #    而这次失败在**别的** job（`detect`）里 ⇒ 工具按 job 级结论看得见。
+          #    这正是 #17 的修法：把上报搬出那个正在失败的 job。
           python3 .github/scripts/report-failure.py \
             --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
             --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --upstream-sha "${{ steps.detect.outputs.upstream_sha }}" \
-            --merge-sha "${{ steps.merge.outputs.merge_sha }}" \
-            --merge-base "${{ steps.detect.outputs.merge_base }}" \
-            --base-sha256 "$(cat base.sha256 2>/dev/null || true)" \
+            --upstream-sha "${{ needs.detect.outputs.upstream_sha }}" \
+            --merge-sha "${{ needs.detect.outputs.merge_sha }}" \
+            --merge-base "${{ needs.detect.outputs.merge_base }}" \
+            --base-sha256 "${{ needs.detect.outputs.base_sha256 }}" \
             --work-branch "$WORK_BRANCH" \
             --heartbeat-branch "$HEARTBEAT_BRANCH" \
             --json-out report-failure.json \
