@@ -691,48 +691,114 @@ jobs:
       #    又核了一遍：`--expect-merge-sha` 不符时这一步当场失败。
       #    ⚠️ 用 `--no-checkout`：只造对象，**不移动 HEAD、不碰工作区**。
       #
-      # ⚠️ **`--merge-sha` / `--base-sha` 都从那个对象现取**，不经过任何 inputs：
-      #    「试合并时的本线 HEAD」就是合并提交的**父[0]**。
-      #    （本工单实测：给它单开一个 input 会让 `workflow_dispatch` 的 inputs 超限，
-      #      检测器派发**当场 422**。少一个能写歪的输入本来也更好。）
+      # ⚠️ **`--merge-sha` / `--base-sha` 都从**重放那一步的输出**里取**
+      #    （`id: replay` + `--github-output`），**不能**用 `git rev-parse HEAD`：
+      #    重放用的是 `--no-checkout`，它**刻意不移动 HEAD**（`try-merge.py` 里有断言），
+      #    所以那时 `HEAD` 仍是 checkout 出来的**分支尖端**，而不是合并提交。
+      #    🚨 第一版就是写的 `MSHA="$(git rev-parse HEAD)"` —— 那是从 `detect.yml` 的
+      #    **试合并**那一步照抄来的，而那一步用的是**默认 checkout**（会 `reset --hard`
+      #    到合并提交）⇒ 同一句在那边对、在这边错。**照抄一个 idiom 时要看它的前提。**
+      #    （独立审查抓到；这是本工单最严重的一处 —— 它会让这一步**每次必然红**，
+      #      而报错读起来像「参数写错了」。）
       #
-      # ⚠️ **这一节的 checkout 是 detached**（`ref: ${{ github.sha }}` = 合并提交），
+      # ⚠️ 拿到之后**再核一遍 `== inputs.merge_sha`**：`try-merge.py` 的
+      #    `--expect-merge-sha` 已经核过一次，但那条断言的结果**没有任何人读**
+      #    （它的退出码就是这一步的退出码，仅此而已）。多这一句，「要推的 = 编过的」
+      #    才是一条**看得见**的判据 —— 而不是文档里的一句宣称。
+      #
+      # ⚠️ **这一节的 checkout 是 detached**（`ref: ${{ github.sha }}`），
       #    而推分支**不需要**站在那条分支上（写的是 `refs/heads/<branch>`）。
       #    第一版的 `promote.py` 加了「必须检出在 --branch 上」的守卫 ⇒ CI 上必然失败，
       #    已删掉，并在自测里用 detached HEAD 钉住（用例 ⑧）。
       - name: "Promote: fast-forward the work branch to the merge (only when everything is green)"
+        id: promote
         if: success() && inputs.merge_sha != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          echo "本 job 检出到 = $(git rev-parse HEAD)（detached at ${{ github.sha }}）"
+          echo "本 job 检出到 = $(git rev-parse HEAD)（detached；⚠️ 它**不是**合并提交）"
           python3 .github/scripts/try-merge.py --no-checkout --repo-dir . \
             --work-branch "$WORK_BRANCH" \
             --upstream-url "${{ inputs.upstream_url }}" \
             --upstream-sha "${{ inputs.upstream_sha }}" \
             --merge-base "${{ inputs.merge_base }}" \
-            --expect-merge-sha "${{ inputs.merge_sha }}"
+            --expect-merge-sha "${{ inputs.merge_sha }}" \
+            --github-output "$GITHUB_OUTPUT"
 
-          # ⚠️ 从**对象**里取那两个 sha，不用 `${{ github.sha }}`：
-          #    `github.sha` 与「上一步重放出来的那个提交」是两件事 ——
-          #    一旦它们不同（比如再有人给 workflow 加一个 checkout ref），
-          #    下面推上去的就会是**另一个**提交，而两处看起来都「对」。
-          MSHA="$(git rev-parse HEAD)"
+          # ⚠️ 从**本步刚写的输出文件**里读，不给重放那一步加 `id:` ——
+          #    `${{ steps.<id>.outputs.* }}` 是同一步里读**自己** outputs 的坑表 #39 的邻居，
+          #    而这里的值就在手边的文件里，读它**不跨 step、也不依赖 runner 的解析**。
+          #    ⚠️ 取**最后**一个 `merge_sha=`：`--github-output` 是**追加**写，
+          #    文件里可能已经有别的来源写过同名键（重跑、或调用方先写过一次）。
+          MSHA="$(sed -n 's/^merge_sha=//p' "$GITHUB_OUTPUT" | tail -1)"
+          if [ -z "$MSHA" ]; then
+            echo "❌ 重放那一步没写出 merge_sha（--github-output 没生效？）"
+            echo "   ⇒ 不肯用 HEAD 兜底：--no-checkout 下 HEAD 是**分支尖端**，不是合并提交。"
+            echo "   本步的输出文件逐字如下："
+            cat "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          if [ "$MSHA" != "${{ inputs.merge_sha }}" ]; then
+            echo "❌ 重放出来的合并提交与检测器给的不是同一个 —— **这一步不能推**："
+            echo "   重放   $MSHA"
+            echo "   检测器 ${{ inputs.merge_sha }}"
+            echo "   ⇒ 最可能的原因：本线分支在「检测器试合并」与「本 run 重放」之间动过。"
+            echo "      推上去的会是一个**没被这次构建验过**的提交 ⇒ 按规格就该失败。"
+            exit 1
+          fi
           PARENT="$(git rev-parse "$MSHA^1")"
-          echo "合并提交   = $MSHA"
+          echo "合并提交   = $MSHA（= 检测器给的那个，已核 ✅）"
           echo "父[0] 本线 = $PARENT（试合并时的本线 HEAD）"
 
           # ★ 判定与写入都在工具里（接缝 S6）。它只发**一次**写请求：
           #    `PATCH refs/heads/<分支>`，`force: false` ⇒ 非快速前进时平台自己拒。
           #    退出码 3（分支已前进）与 4（并发被抢）都是**正常结论**：这次不推，分支没动。
+          set +e
           python3 .github/scripts/promote.py \
             --repo "$GITHUB_REPOSITORY" --branch "$WORK_BRANCH" --repo-dir . \
             --merge-sha "$MSHA" \
             --base-sha "$PARENT" \
             --upstream-sha "${{ inputs.upstream_sha }}" \
             --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --summary "$GITHUB_STEP_SUMMARY" --github-output "$GITHUB_OUTPUT"
+            --json-out promote.json \
+            --summary "$GITHUB_STEP_SUMMARY"
+          RC=$?
+          set -e
+          # 把退出码交出去给下一步（它要据此决定要不要做收尾复核）——
+          # 走 `$GITHUB_OUTPUT` 比 `$GITHUB_ENV` 好：**本步的** outputs 下一步才读得到，
+          # 正好是我们要的时序，而且不会污染后续所有步骤的环境。
+          echo "exit_code=$RC" >> "$GITHUB_OUTPUT"
+          case "$RC" in
+            0) echo "✅ 推进完成（或远端本来就在这个提交上）" ;;
+            3|4)
+              # ⚠️ **这两档不是「构建失败」**：分支一个字节都没动，只是这一轮没推成
+              #    （分支上有别的东西 / 并发被抢）。按 `promote.py` 的文件头，
+              #    它们是**正常结论** —— 所以这一步**不红**。
+              #    但摘要与日志里必须看得见（下面那句 echo），下一轮检测器会按新的 HEAD
+              #    重新试合并，那时才是正确的动作。
+              echo "⚠️ 本次**没有推**（退出码 $RC）：分支没动。"
+              echo "   3 = 分支已前进（有别的东西先推上去了）；4 = 并发被抢（PATCH 被平台拒）。"
+              echo "   ⇒ 不需要人工处理：等下一轮检测器按**新的** HEAD 重新试合并。"
+              # ★ 「分支没动」这半句**当场读远端复核**，不是一句承诺 ——
+              #    与 detect.yml 收尾复核同一个做法（本地那条分支不是判据）。
+              NOW="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$WORK_BRANCH" --jq .object.sha)"
+              echo "   远端复核：$WORK_BRANCH = $NOW"
+              echo "   本次要推的是 $MSHA ⇒ $( [ "$NOW" = "$MSHA" ] && echo '⚠️ 已经是它了（另一轮推上去的）' || echo '不是它 —— 分支确实没被这次改动 ✅' )"
+              { echo ""; echo "### 推进工作分支（#9）：本次**没有推**"
+                echo ""
+                echo "退出码 \`$RC\`（3 = 分支已前进 / 4 = 并发被抢）⇒ **分支一个字节都没动**。"
+                echo "远端复核：\`$WORK_BRANCH\` = \`$NOW\`。"
+                echo ""
+                echo "⇒ 等下一轮检测器按**新的** HEAD 重新试合并；不需要人工介入。"; } \
+                >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "❌ promote.py 失败（退出码 $RC）：1 = 运行错误，2 = 用法/前置错误。"
+              echo "   分支一个字节都没动（写请求根本没发出去，或已被平台拒）。"
+              exit "$RC"
+              ;;
+          esac
 
       # ⚠️ 收尾复核：**用 `gh api` 读远端**，而不是读本地。
       #    本地那条分支本来就不是判据（这个 job 是 detached 检出）——
@@ -742,7 +808,11 @@ jobs:
       #    另一次 API 往返。两条判据不同，不能合成一条。
       - name: "收尾复核：工作分支确实前进到了那次合并（读远端，不读本地）"
         id: confirm
-        if: success() && inputs.merge_sha != ''
+        # ⚠️ 多一条 `steps.promote.outputs.exit_code == '0'`：退出码 3/4 是
+        #    「这一轮没推」（分支没动），那时**不该**要求远端等于这次合并 ——
+        #    否则「分支被别人动过」这个**最需要看远端**的情形，反而会把复核跳过。
+        #    第一版只挂 `success()`，而 3/4 被上面那一步吞成绿 ⇒ 复核被静默跳过。
+        if: success() && inputs.merge_sha != '' && steps.promote.outputs.exit_code == '0'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
