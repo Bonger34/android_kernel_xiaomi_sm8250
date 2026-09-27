@@ -727,8 +727,9 @@ jobs:
             --github-output "$GITHUB_OUTPUT"
 
           # ⚠️ 从**本步刚写的输出文件**里读，不给重放那一步加 `id:` ——
-          #    `${{ steps.<id>.outputs.* }}` 是同一步里读**自己** outputs 的坑表 #39 的邻居，
-          #    而这里的值就在手边的文件里，读它**不跨 step、也不依赖 runner 的解析**。
+          #    跨 step 引用表达式是本仓库**坑表 #39** 的邻居（那里踩的是「同一步里读自己的
+          #    outputs 渲染成空」），而这里的值就在手边的文件里，读它**不跨 step、
+          #    也不依赖 runner 的解析**。
           #    ⚠️ 取**最后**一个 `merge_sha=`：`--github-output` 是**追加**写，
           #    文件里可能已经有别的来源写过同名键（重跑、或调用方先写过一次）。
           MSHA="$(sed -n 's/^merge_sha=//p' "$GITHUB_OUTPUT" | tail -1)"
