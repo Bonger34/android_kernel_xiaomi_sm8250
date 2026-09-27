@@ -38,6 +38,10 @@ on:
         description: "本批次对应的上游提交（规格 §5 来源说明四项之一；留空 = 未记录，手动触发就是这样）"
         required: false
         default: ""
+      local_sha:
+        description: "【上游同步通道】试合并时**本线 HEAD** 是哪一个提交。#9 起用于推分支前的复核：它必须等于合并提交的**父[0]**，否则一个请求都不发（留空 = 不推分支）"
+        required: false
+        default: ""
       merge_sha:
         description: "【上游同步通道】要在本线 HEAD 上重放的**合并提交**（检测器试合并算出来的）。留空 = 不合并，直接编分支 HEAD —— 手动触发就是这样"
         required: false
@@ -64,6 +68,7 @@ on:
 #    upstream_sha   上游那个提交
 #    merge_base     那个合并的基点（API 的权威值）
 #    merge_sha      合并提交 —— **两个 build job 各自重放它并断言 sha 相同**
+#    local_sha      **本线 HEAD**（试合并的父[0]）—— #9 起推分支前要核它
 #    base_run_id / base_artifact   检测器取的那份底包（`prepare` 复用它，不自己现拉）
 #    base_sha256    检测器算出的底包哈希（`prepare` 复算一遍交叉验证）
 #
@@ -74,7 +79,7 @@ on:
 #  两次构建逐字节比对（issue #6，规格实现决定 5 与用户故事 12）
 #
 #  拓扑：prepare（哨兵 + 取一次底包） → build ×2（两个独立 runner，max-parallel=1）
-#        → repro（比对 + 闸门第六项 + 运行摘要）
+#        → repro（比对 + 闸门第六项 + 运行摘要 + **全绿才推分支**）
 #
 #  ⚠️ 三条不许动的约束，每一条都直接对应一条验收：
 #   ① **底包只取一次，由 prepare 分发**。两次各自「现拉最新」的话，官网恰好跨期
@@ -89,7 +94,19 @@ on:
 #  ⚠️ 判定入口没有变：仍是 `verify-release.py --line los --repro <第二目录>`（接缝 S1）。
 #     `repro-compare.py` 只负责**取证**（差异落在哪个文件、哪一段）与**写摘要**，
 #     它不取代闸门 —— 「谁说了算」只有一个答案。
+#
+#  ⚠️ **推进工作分支是 issue #9**，而且是**这条 workflow 的最后一步**（在 `repro` job 里）：
+#     只有前面每一步都 success（哨兵 → 编译 ×2 → 逐字节比对 → 发布闸门）才会走到它。
+#     红的运行**根本不会调用** `promote.py` ⇒ 「分支一个字节都不动」是结构性的，
+#     而不是靠工具自己克制。工具本身是 `promote.py`（接缝 S6），它只发**一次**
+#     `PATCH refs/heads/<分支>` 且 `force: false`。
 # ══════════════════════════════════════════════════════════════════════════════
+
+env:
+  # 本线的**跟随分支**（= 本仓库默认分支）。⚠️ 与 `detect.yml` 的 `WORK_BRANCH`
+  # 必须一致 —— 两处写歪一个，「检测器试合并的分支」与「构建器推进的分支」就不是同一条。
+  # （#9 起构建器也会写它，所以这个变量在这里**不再是只读的展示用**。）
+  WORK_BRANCH: ksu-lineage-23.2
 
 jobs:
   # ══ 准备：环境哨兵 + 取一次底包 ═══════════════════════════════════════════════
@@ -563,15 +580,25 @@ jobs:
           include-hidden-files: true
           if-no-files-found: warn
 
-  # ══ 比对：取证 + 判定 + 运行摘要（issue #6 的核心）═════════════════════════════
+  # ══ 比对：取证 + 判定 + 运行摘要 + **全绿才推分支**（issue #6 的核心 / issue #9）═══
   # ⚠️ `if: always()`：两次编译**任一失败**时这一节照样要跑 ——
   #    ① 失败的那次仍有 dist（上传那一步是 always）；
   #    ② 摘要里要说清「这一节为什么没得出结论」，而不是整节消失。
+  #    ⚠️ 也正是因为它带 `always()`，**推分支那一步必须自己带 `success()`** ——
+  #       否则一次失败的构建会把合并推上去，而那正好违反 issue #9 的核心验收。
   repro:
     needs: [prepare, build]
     if: always()
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    # ⚠️ **一旦写了 `permissions:`，没列出的权限一律变 `none`。**
+    #    #9 起这一步要**推分支** ⇒ 必须有 `contents: write`（PATCH ref 要它；
+    #    `contents: read` 已含在里面，下载 artifact 与 checkout 都靠它）。
+    #    漏了它只会在**跑完 20 分钟之后**才报 403 `Resource not accessible by integration`
+    #    —— 那正是规格实现决定 1 里记的那条坑。`actions: read` 是下载 artifact 用的。
+    permissions:
+      contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -640,3 +667,79 @@ jobs:
             echo "退出码 0 = 两次构建逐字节相同（且三件套、KSU 符号、同源、哈希清单都过）。"
           } >> "$GITHUB_STEP_SUMMARY"
           exit $RC
+
+      # ══ issue #9：**全绿才推分支** ═════════════════════════════════════════════
+      # 「工作分支 = 可发布状态」这个不变量，从这里开始由机器守住。
+      #
+      # ⚠️ **为什么是这一步的条件，而不是工具里的一个开关**：
+      #    `if:` 里的 `success()` 覆盖前面**所有**步骤（哨兵 → 编译 ×2 → 逐字节比对
+      #    → 发布闸门）。也就是说：红的运行**根本不会调用** `promote.py`，
+      #    「分支一个字节都不动」是结构性的，不靠工具自己克制。
+      #    再叠一条 `inputs.merge_sha != ''`：手动触发的兜底路径（没有合并要推）走不到这里。
+      #
+      # ⚠️ **为什么还要先重放一次合并**：合并提交**不在任何 ref 上**（`try-merge.py`
+      #    按规格绝不 push），而 GitHub 的 upload-pack **不提供不可达对象** ——
+      #    本工单实测：`git fetch --no-tags origin <合并提交>` 回
+      #    `fatal: remote error: upload-pack: not our ref <sha>`。
+      #    ⇒ 这个 job 是**新的检出**，本地没有那个对象，只能原地重放一遍
+      #    （确定性已在 #8 证明）。顺带把「要推的就是那两个 build job 编的那个提交」
+      #    又核了一遍：`--expect-merge-sha` 不符时这一步当场失败。
+      #    ⚠️ 用 `--no-checkout`：只造对象，**不移动 HEAD、不碰工作区**。
+      #
+      # ⚠️ **这一节的 checkout 是 detached**（`ref: ${{ github.sha }}` = 合并提交），
+      #    而推分支**不需要**站在那条分支上（写的是 `refs/heads/<branch>`）。
+      #    第一版的 `promote.py` 加了「必须检出在 --branch 上」的守卫 ⇒ CI 上必然失败，
+      #    已删掉，并在自测里用 detached HEAD 钉住（用例 ⑧）。
+      - name: "Promote: fast-forward the work branch to the merge (only when everything is green)"
+        if: success() && inputs.merge_sha != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "本 job 检出到 = $(git rev-parse HEAD)（detached at ${{ github.sha }}）"
+          python3 .github/scripts/try-merge.py --no-checkout --repo-dir . \
+            --work-branch "$WORK_BRANCH" \
+            --upstream-url "${{ inputs.upstream_url }}" \
+            --upstream-sha "${{ inputs.upstream_sha }}" \
+            --merge-base "${{ inputs.merge_base }}" \
+            --expect-merge-sha "${{ inputs.merge_sha }}"
+
+          # ★ 判定与写入都在工具里（接缝 S6）。它只发**一次**写请求：
+          #    `PATCH refs/heads/<分支>`，`force: false` ⇒ 非快速前进时平台自己拒。
+          #    退出码 3（分支已前进）与 4（并发被抢）都是**正常结论**：这次不推，分支没动。
+          python3 .github/scripts/promote.py \
+            --repo "$GITHUB_REPOSITORY" --branch "$WORK_BRANCH" --repo-dir . \
+            --merge-sha "${{ inputs.merge_sha }}" \
+            --local-sha "${{ inputs.local_sha }}" \
+            --upstream-sha "${{ inputs.upstream_sha }}" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --summary "$GITHUB_STEP_SUMMARY" --github-output "$GITHUB_OUTPUT"
+
+      # ⚠️ 收尾复核：**用 `gh api` 读远端**，而不是读本地。
+      #    本地那条分支本来就不是判据（这个 job 是 detached 检出）——
+      #    「有没有推上去」只有远端说了算。同 `detect.yml` 的收尾复核。
+      #    ⚠️ 它**不是**冗余：`promote.py` 自己已经读过一次（推完复核），
+      #    这一条问的是另一个问题 —— 「整个 run 结束时远端是什么」，而中间还夹着
+      #    另一次 API 往返。两条判据不同，不能合成一条。
+      - name: "收尾复核：工作分支确实前进到了那次合并（读远端，不读本地）"
+        id: confirm
+        if: success() && inputs.merge_sha != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NOW="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$WORK_BRANCH" --jq .object.sha)"
+          WANT="${{ inputs.merge_sha }}"
+          if [ "$NOW" != "$WANT" ]; then
+            echo "❌ 工作分支 $WORK_BRANCH 是 $NOW，而这次要推的是 $WANT"
+            echo "   ⇒ promote.py 报了成功却没推上去，或者中途有别的东西动了这条分支。"
+            exit 1
+          fi
+          echo "✅ 工作分支 $WORK_BRANCH = $NOW（= 这次合并）"
+          # ⚠️ 摘要里用**本步算出来的** shell 变量（`$NOW`），不用 `${{ steps... }}`：
+          #    一个 step 引用自己的 outputs 渲染出来是空的（PROJECT.md §7 坑表 #39）。
+          { echo ""; echo "### 推进工作分支（#9）"; echo ""
+            echo "\`$WORK_BRANCH\` 复读远端 = \`$NOW\`（= 这次合并，读**远端** ref 复核）"
+            echo ""
+            echo "⇒ 「工作分支 = 可发布状态」：只有**整条链全绿**才会走到这一步。"; } \
+            >> "$GITHUB_STEP_SUMMARY"
