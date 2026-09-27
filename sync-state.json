@@ -1,5 +1,8 @@
 {
-  "failed": null,
+  "failed": {
+    "at": "2026-09-27",
+    "upstream": "7ec2e2470809686ebe518c87d6f8ee60cd0bf02f"
+  },
   "heartbeat": {
     "at": "2026-09-26",
     "at_utc": "2026-09-26T18:45:33Z",
