@@ -29,8 +29,16 @@
 #     只有 `detect.py` 判出 `drifted` 才走；无漂移时一次运行仍是 50 秒左右就结束。
 #
 #  ⚠️ **本文件永远不推工作分支**（#9 起这条更明确）：它只读它、试合并、派发。
-#     推分支只发生在构建器那边的最后一步，且必须在整条链全绿之后。
+#     推工作分支只发生在构建器那边的最后一步，且必须在整条链全绿之后。
 #     本文件的「收尾复核」正是这条不变量的反向守卫 —— 分支在本次运行里动过就**响亮地红**。
+#
+#  ⚠️ #9 起本文件会推**一条临时 ref**（`sync-staging`）—— 那是**运输工具，不是发布判据**：
+#     本地 `commit-tree` 造的合并提交**服务端根本不存在**（实测历史合并提交 REST 全 404），
+#     于是构建全绿之后 `PATCH refs/heads/<工作分支>` 会回
+#     `{"message": "Object does not exist"}`（run 36311829440 实测）。
+#     让那个提交经过一条 ref 之后它才成为服务端对象 —— 而那一条**绝不是工作分支**。
+#     ℹ️ 这处决定改了规格里「试合并**绝不 push**」那句字面约束（用户 2026-09-27 裁定，方案 A）；
+#        它的**目的**（工作分支不提前前进）完整保住，且工作分支那一步**永远** `force: false`。
 # ══════════════════════════════════════════════════════════════════════════════
 name: Detect upstream drift (heartbeat + drift)
 
@@ -87,6 +95,10 @@ env:
   #    时生效（CI 永远用这里传过去的值）。两处写歪一个，本机手跑与 CI 就会写到**两条**
   #    分支上去，而两边看起来都是绿的。改这里时顺手改那一行。
   HEARTBEAT_BRANCH: sync-heartbeat
+  # 临时 ref：**只用来把那次合并的提交「种子投放」到服务端**（#9）。
+  # ⚠️ 它不是发布判据 —— 工作分支要等构建全绿才前进（见下面那一步的长注释）。
+  # ⚠️ 必须与 `build.yml` 的 `STAGING_REF` 一致（那边用它做推前复核与收尾清理）。
+  STAGING_REF: sync-staging
 
 jobs:
   detect:
@@ -254,6 +266,72 @@ jobs:
             echo "- 合并提交 \`$MSHA\`（父 = 本线 HEAD \`$BEFORE\` + 上游提交）"
             echo "- 工作分支 \`$WORK_BRANCH\` 复核后仍是 \`$NOW\` —— **没动**"
             echo "- 复核用 \`gh api\` 读**远端** ref（不是读本地）——本地那条分支本来就不是判据"; } \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # ══ #9：给这次合并**做种子投放** ══════════════════════════════════════════
+      # 🚨 **为什么非做不可**（2026-09-27 实测，不是推断）：
+      #    合并提交是 runner 上 `git commit-tree` 造出来的，**不在任何 ref 上**
+      #    ⇒ **服务端根本没有这个对象**。证据：`GET /git/commits/<三个历史合并提交>`
+      #    **全 404**（包括刚在 CI 里被 `actions/checkout` 成功检出的那一个）；
+      #    而由 Git Data API 造的对象读得回来。于是构建全绿之后那一步
+      #    `PATCH refs/heads/<工作分支>` 回 **`{"message": "Object does not exist"}`**。
+      #    ⚠️ **「能检出」≠「服务端认它」** —— 这是最容易误判的一点。
+      #    ⚠️ 也**不能**改用「API 自己造那个合并提交」：API 会把 `+08:00` 规范成 `Z`
+      #    ⇒ 服务端造的 sha 与本地重放的**必然不同**，两个 build job 会对不上。
+      #
+      # ⇒ 唯一的路：让那个提交**经过一条 ref**成为服务端对象。
+      #    ⚠️ **那条 ref 绝不是工作分支** —— 工作分支必须等全绿（这是 #9 的全部意义）。
+      #    所以推到一条**临时 ref**（`sync-staging`）里当运输工具：
+      #      · 它的存在**不代表**「这批可以发」—— 没有任何产物对着它发；
+      #      · 构建全绿之后 `repro` 才把**工作分支**快速前进过去，然后删掉它；
+      #      · 它**不在** `ksu-*` / `lineage-*` 命名空间里（那是工作分支与上游镜像分支），
+      #        与心跳分支 `sync-heartbeat` 同一个 `sync-` 前缀，一眼看得出是这条通道的。
+      #
+      # ⚠️ `--force` 是**故意**的：temp ref 是**纯运输工具**，没有「历史」可言；
+      #    不用 force 的话，某次失败留下的旧种子会让下一轮推送被拒（一次无意义的红）。
+      #    工作分支那边**永远**是 `force: false`（`promote.py` 里唯一的写操作）。
+      - name: "种子投放：把合并提交推到临时 ref（服务端才会认它）"
+        if: steps.detect.outputs.state == 'drifted' && github.event.inputs.dry_run != 'true'
+        env:
+          # ⚠️ 这一步要用它两处：`git push` 的 URL 里、以及 `gh api` 复核时。
+          #    没在这一步的 env 里声明的话，`$GH_TOKEN` 会是空的 ——
+          #    而**空的 token 不会让 `gh api` 报错**，它会退化成未认证请求（读接口碰巧还能通）。
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          MSHA="${{ steps.merge.outputs.merge_sha }}"
+          if [ -z "$MSHA" ]; then
+            echo "❌ 拿不到合并提交的 sha —— 种子投放无从做起"
+            exit 1
+          fi
+          echo "把 $MSHA 推到 refs/heads/$STAGING_REF（临时 ref，纯运输工具）"
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "$MSHA:refs/heads/$STAGING_REF"
+          # ★ 推完**读远端**复核：服务端现在真的认它了吗？（这一条是本步骤的判据）
+          NOW="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$STAGING_REF" --jq .object.sha)"
+          if [ "$NOW" != "$MSHA" ]; then
+            echo "❌ 推完复核不符：$STAGING_REF 是 $NOW，期望 $MSHA"
+            exit 1
+          fi
+          echo "✅ 复核：refs/heads/$STAGING_REF = $NOW"
+          # ★★ 真正的判据：**服务端现在能不能 REST 读到这个提交**
+          #     （这正是 `PATCH ref` 当初失败的地方 —— 读得到才推得动）
+          CODE="$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$MSHA" --jq .sha 2>/dev/null || echo '')"
+          if [ "$CODE" != "$MSHA" ]; then
+            echo "❌ 服务端还是读不到这个提交（/git/commits/$MSHA）"
+            echo "   ⇒ 种子投放没生效，后面那一步推分支**必然**回 Object does not exist。"
+            exit 1
+          fi
+          echo "✅✅ 服务端已认它：GET /git/commits/$MSHA -> 200"
+          { echo ""; echo "### 种子投放（#9）"; echo ""
+            echo "合并提交 \`$MSHA\` 已推到临时 ref \`$STAGING_REF\`。"
+            echo ""
+            echo "**为什么需要这一步**：本地 \`commit-tree\` 造的对象**服务端不存在**"
+            echo "（实测历史合并提交 REST 全 404），于是构建全绿后 \`PATCH ref\` 会回"
+            echo "\`Object does not exist\`。经一条**临时 ref**（而不是工作分支）之后，"
+            echo "它才成为服务端对象。"
+            echo ""
+            echo "⚠️ 工作分支 \`$WORK_BRANCH\` **仍然没动** —— 那条 ref 才是「可发布」的判据。"; } \
             >> "$GITHUB_STEP_SUMMARY"
 
       - name: "取底包：**整条通道只取一次**，两个 build job 共用这一份"
