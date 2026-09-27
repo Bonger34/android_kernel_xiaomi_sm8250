@@ -19,7 +19,8 @@
 ⇒ 判定改看 **`GET /actions/runs/<id>/jobs`** 的逐 job 结论 + 逐 step 结论，
 而 **`startup_failure`（run 根本没起来）在这一层是够不着的** —— 但那种情形下
 本工具**根本不会被调用**（没有 runner 去跑 `notify`）⇒ 「不写标记」是**结构性**的，
-不需要一条永远不会响的检查（同类批评见 `detect.py` 文件头里删掉的那条）。
+不需要一条永远不会响的检查（同类批评见 `detect.py` 的 `run()` 里删掉的那条
+「新旧内容逐字相同 ⇒ 报错」）。
 
 同理，**取消**也有一半是结构性的：一次被取消的 run 里 `notify` 通常根本不会开始。
 但只要它开始了，job 级判定就接管 —— 于是「取消」这一档**有**一条真的会响的检查。
@@ -74,6 +75,7 @@ import datetime
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import urllib.parse
@@ -102,6 +104,7 @@ ISSUE_LABEL = "needs-triage"     # 本仓库**已存在**的标签（见 docs/ag
 ISSUE_PAGE = 100                 # 列 issue 时一页多少条
 ISSUE_MAX_PAGES = 10             # 超过就**拒绝给结论**（宁可响亮地失败，也不要开第二个 issue）
 JOBS_PAGE = 100                  # 列 job 时一页多少条（同一个理由）
+ARTIFACTS_PAGE = 100             # 列产物时一页多少条（同一个理由）
 
 
 def _load_sibling(name, filename):
@@ -134,6 +137,24 @@ def qp(x):
 
 def short(sha):
     return (sha or "")[:12]
+
+
+def assert_sha(name, value):
+    """形状守卫：**完整的 40 位十六进制**。
+
+    ⚠️ 为什么必须有它（而不是「反正传错也是人的问题」）：`failed.upstream` 是
+    `sync-check.py` 判「同一个提交已试过」的**唯一**依据，而那条比较是**精确相等**
+    （`check()` 里 `failed_sha == upstream`）。写歪一个字符（短 sha、带空格、大写没归一）
+    的后果**不是报错，而是这条判据永不成立** —— 检测器照常为它派发构建，
+    而 issue 正文里那句「7 天内不会再触发构建」变成一句**没人会去核的假话**。
+    同族两件工具（`try-merge.py` / `promote.py`）都有同一件东西，理由同源：
+    「写歪的 sha 会让 API 去取一个不存在的东西」。
+    """
+    v = (value or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", v.lower()):
+        raise UsageError("%s 必须是完整的 40 位十六进制 sha（收到 %r）—— 短 sha / 带空白都会让"
+                         "失败标记**永远匹配不上**上游 HEAD，而那是静默的" % (name, value))
+    return v.lower()
 
 
 # ── 判定：**纯函数**，所以「哪一档算抖动」这件事可以离线穷举断言 ──────────────────
@@ -170,11 +191,16 @@ def classify(jobs, self_job=None):
 
     ⚠️ **优先级：抖动 > 真失败 > 没有红。** 一次被取消的运行里往往还夹着
     「因为依赖被取消而报失败」的次生 job —— 把它当成真失败会把一个**基础设施问题**
-    变成一次**拉黑**，而拉黑是 7 天。反过来（失败优先）的代价只是少拉黑一次。
+    变成一次**拉黑**，而拉黑是 7 天。反过来（失败优先）的代价要说全：**既不叫人、也不拉黑**
+    （`V_REPORTED` 把「叫人」与「拉黑」绑在同一支上）⇒ 下一次它照常重试、照常红，仍然没人被叫。
+    本工具选前者：**「把偶发抖动记成 7 天拉黑」会让通道安静地停摆**，而那比多红一次贵得多。
 
     ⚠️ `self_job` **必须传**（CI 上从 `GITHUB_JOB` 默认拿到）：本工具跑在自己的 run 里，
     那个 job 的结论此刻还是 `null`，**不能**因为它「没完成」就把它的失败步骤漏掉 ——
-    检测器那条路**只有这一个 job**。
+    检测器那条路**只有这一个 job**。⚠️ 万一 `self_job` 没传对（或 CI 那边改了 job 名），
+    后果**不是报错而是静默**：本 job 会被当成「还没结束」、失败步骤被丢掉 ⇒ 判
+    `V_NO_FAILURE`。所以下面那句「还有 N 个 job 没结束」的 ⚠️ **不是装饰**：
+    它正是这种漂移唯一看得见的痕迹。
     """
     failures, jitter, pending = [], [], []
     for j in jobs or []:
@@ -264,9 +290,16 @@ def new_failed_state(old_text, upstream_sha, today, expire_days):
                         "已经有这个提交的失败标记（%s 记的，%d 天前，窗口 %d 天）"
                         "⇒ 不重记日期" % (at, age, expire_days), keep_hb))
                 st["failed"] = {"upstream": sha, "at": today.isoformat()}
+                if age is None:
+                    # `at` 写坏。⚠️ 措辞不能写成「已过期」—— 那不是事实。事实是：
+                    # `sync-check.py` 对同样的坏法判「损坏 ⇒ **不拉黑**」，所以**重新起算**才是对的。
+                    return Marker(st, True, _hb_note(
+                        "旧标记是同一个提交，但 `at` 读不出（%r）⇒ 重新记一次"
+                        "（`sync-check` 对同样的坏法判「损坏 ⇒ 不拉黑」，所以这次要自己起算）"
+                        % at, keep_hb))
                 return Marker(st, True, _hb_note(
-                    "旧标记是同一个提交但**已过期**（%s，%s 天前）⇒ 重新记一次"
-                    % (at, "?" if age is None else age), keep_hb))
+                    "旧标记是同一个提交但**已过期**（%s，%d 天前）⇒ 重新记一次"
+                    % (at, age), keep_hb))
             st["failed"] = {"upstream": upstream_sha.lower(), "at": today.isoformat()}
             return Marker(st, True, _hb_note(
                 "上一个标记是**别的**提交（%s，%s）⇒ 换成这一次的" % (sha[:12], at), keep_hb))
@@ -307,8 +340,9 @@ def issue_title(upstream_sha):
 
 def _artifact_lines(artifacts):
     if not artifacts:
-        return ["**这次没有产物** —— 失败发生在产出产物之前（artifact 那一步是 `if: always()`，"
-                "所以只要产出过就一定在）。"]
+        return ["**这次没有产物** —— 失败发生在产出产物之前。"
+                "（两份 `dist` 与 `kernel-image-*` 的上传是 `if: always()`，只要产出过就在；"
+                "检测器那条路本来就不产出任何东西。）"]
     L = ["| artifact | 字节 | 状态 |", "|---|---|---|"]
     for a in artifacts:
         L.append("| `%s` | %s | %s |"
@@ -319,14 +353,19 @@ def _artifact_lines(artifacts):
     return L
 
 
-def issue_body(a, verdict, artifacts, marker_note, expire_days, count=1):
-    """新建 issue 的正文。四项硬要求：**上游提交号**、**失败环节**、产物、以及怎么恢复。"""
+def issue_body(a, verdict, artifacts, marker_note, expire_days):
+    """新建 issue 的正文。四项硬要求：**上游提交号**、**失败环节**、产物、以及怎么恢复。
+
+    ⚠️ 「已经自动做的处置」那一节的措辞是**按顺序写的**：本文件先发 issue、**之后**才写标记
+    （见文件头不变量 ②）。所以那句不能写成「✅ 已记下…」—— 那种写法在标记写失败时就成了假话
+    （坑表 #34 的同形：一份文件里的结论只能覆盖**它写下之前**发生的事）。
+    """
     f = verdict.failures[0] if verdict.failures else None
     L = ["## 这次上游同步没能自动跑完（自动开的 issue）", "",
          "> 由 CI 自动创建（`.github/scripts/report-failure.py`，issue #10）。",
          "> **同一个上游提交只会有一个 issue** —— 后续同类失败**追加评论**，不会刷屏。", "",
          "| 项 | 值 |", "|---|---|",
-         "| **上游提交** | `%s` |" % (a.upstream_sha or "（未记录）"),
+         "| **上游提交** | `%s` |" % a.upstream_sha,
          "| **失败环节** | %s |" % (f.headline() if f else "（未识别）"),
          "| 运行 | [run %s](%s) |" % (_run_id_of(a.run_url), a.run_url),
          "| 工作分支 | `%s`（**一个字节都没动**） |" % a.work_branch,
@@ -334,28 +373,27 @@ def issue_body(a, verdict, artifacts, marker_note, expire_days, count=1):
                                 if a.merge_sha else "（本次没有合并）"),
          "| 合并基点 | %s |" % ("`%s`" % a.merge_base if a.merge_base else "（未记录）"),
          "| 底包 sha256 | %s |" % ("`%s`" % a.base_sha256 if a.base_sha256 else "（未记录）"),
-         "| 失败标记 | %s |" % ("`failed.upstream = %s`（%s）" % (short(a.upstream_sha), marker_note)
-                                if a.upstream_sha else "（没有上游提交可记）"),
+         "| 失败标记 | %s |" % ("`failed.upstream = %s`（%s）" % (short(a.upstream_sha), marker_note)),
          ""]
-    if count > 1:
-        L += ["⚠️ 这是这个上游提交的**第 %d 次**失败上报 —— issue 只开一个，后面都是评论。" % count, ""]
     L += ["### 失败在哪个环节", "",
           "```"] + _failure_block(verdict) + ["```", ""]
     if verdict.pending:
         L += ["⚠️ 有 %d 个 job 当时还没结束，**没被计入**：%s"
               % (len(verdict.pending), "、".join(verdict.pending)), ""]
     L += ["### 失败产物", ""] + _artifact_lines(artifacts) + ["",
-          "### 已经自动做的处置", "",
-          "- ✅ 记下「**上游 `%s` 已经试过**」⇒ %s"
-          % (short(a.upstream_sha), ("**7 天内**检测器不会再为它触发构建"
-                                     "（判定在 `sync-check.py`，退出码 20）。" if a.upstream_sha
-                                     else "（本次没有上游提交，未写标记）")),
-          "- ✅ 工作分支 `%s` **一个字节都没动**（红的运行根本不会调用 `promote.py`）。" % a.work_branch,
+          "### 这条通道接下来会做什么", "",
+          "- `failed.upstream` 会被记成 `%s`（**本文件写在它之前**）⇒ 接下来 %d 天内，"
+          "检测器不会再为这个上游提交触发构建（判定在 `sync-check.py`，退出码 20）。"
+          % (short(a.upstream_sha), expire_days),
+          "  ⚠️ 万一那一步失败（并发写 / 权限），本轮退出码 1 —— 而**下一轮会照常重试**，"
+          "不会静默拉黑。",
+          "- ✅ 工作分支 `%s` **一个字节都没动**（红的运行根本不会调用 `promote.py`）——"
+          "这一条是**结构性**的，不依赖上面那一步。" % a.work_branch,
           "",
           "### 怎么恢复", "",
           "1. 看上面的运行日志与产物，定位原因；",
-          "2. 修好之后**不必等 7 天**：打开 `%s` 分支上的 `%s`，把 `\"failed\"` 改成 `null`"
-          % (a.heartbeat_branch, a.state_path),
+          "2. 修好之后**不必等 %d 天**：打开 `%s` 分支上的 `%s`，把 `\"failed\"` 改成 `null`"
+          % (expire_days, a.heartbeat_branch, a.state_path),
           "   并提交 —— 下一轮检测器就会重新尝试这个提交；",
           "3. 或者什么都不做：标记 **%d 天后自动过期**，届时同一提交会被**重新**尝试。" % expire_days,
           "",
@@ -381,10 +419,15 @@ def _run_id_of(url):
     return (url or "").rstrip("/").rsplit("/", 1)[-1] or "?"
 
 
-def failed_comment(a, verdict, artifacts, marker_note):
-    """再次失败时追加的评论（比正文短，但**同样**含上游提交号与失败环节）。"""
+def failed_comment(a, verdict, artifacts, marker_note, expire_days, count):
+    """再次失败时追加的评论（比正文短，但**同样**含上游提交号与失败环节）。
+
+    `count` = 「这是这个上游提交的第几次失败」（正文算第 1 次）；⚠️ 它**只在这个分支上**有意义 ——
+    第一版把它挂在 `issue_body()` 上，而那条路径永远只有第 1 次（`existing` 为假才会新建）
+    ⇒ 一个**到不了**的分支（code-review 抓到）。
+    """
     f = verdict.failures[0] if verdict.failures else None
-    L = ["### 同一个上游提交**又失败了一次**（自动追加）", "",
+    L = ["### 同一个上游提交**又失败了一次**（自动追加，第 %d 次）" % count, "",
          "| 项 | 值 |", "|---|---|",
          "| 上游提交 | `%s` |" % a.upstream_sha,
          "| 失败环节 | %s |" % (f.headline() if f else "（未识别）"),
@@ -394,8 +437,8 @@ def failed_comment(a, verdict, artifacts, marker_note):
          "| 失败标记 | %s |" % marker_note,
          "",
          "```"] + _failure_block(verdict) + ["```", "",
-         "> ⚠️ 标记的日期**没有重记**（7 天窗口仍从第一次失败起算）—— 否则一个反复重试的提交"
-         "会被永久拉黑，而那正是规格要防的事。"]
+         "> ⚠️ 标记的日期**没有重记**（%d 天窗口仍从第一次失败起算）—— 否则一个反复重试的提交"
+         "会被永久拉黑，而那正是规格要防的事。" % expire_days]
     return "\n".join(L) + "\n"
 
 
@@ -412,7 +455,7 @@ def render_summary(r):
     if r["verdict"] == V_JITTER:
         L += ["### 不写标记、不开 issue", "",
               "超时 / 取消 / 启动失败**不是构建失败**（规格实现决定 7）：",
-              "偶发的基础设施抖动不该把某个上游提交拉黑 7 天。",
+              "偶发的基础设施抖动不该把某个上游提交拉黑 %d 天。" % r["expire_days"],
               "下一轮检测器会**自己重试**同一个提交。", ""]
     elif r["verdict"] == V_NO_UPSTREAM:
         L += ["### 没有上游提交可记", "",
@@ -429,7 +472,8 @@ def fetch_jobs(api, repo, run_id):
     """读这次 run 的 job 列表。
 
     ⚠️ 满一页**拒绝给结论**：只看见 100 个 job 就宣布「哪些红了」是典型的「不完整的绿」
-    （坑表 #32）—— 我们的 run 只有 4 个 job，真要撞上这条线，说明**别的**东西也不对了。
+    （坑表 #32）—— 我们的 run 是 5 个 job（`prepare` + `build ×2` + `repro` + `notify`），
+    真要撞上这条线，说明**别的**东西也不对了。
     """
     jobs = api.call("GET", "repos/%s/actions/runs/%s/jobs?per_page=%d" % (repo, run_id, JOBS_PAGE))
     items = (jobs or {}).get("jobs") or []
@@ -440,17 +484,27 @@ def fetch_jobs(api, repo, run_id):
 
 
 def fetch_artifacts(api, repo, run_id):
-    a = api.call("GET", "repos/%s/actions/runs/%s/artifacts?per_page=100" % (repo, run_id))
-    return (a or {}).get("artifacts") or []
+    """读这次 run 的产物清单。
+
+    ⚠️ 与 `fetch_jobs` 同一条规矩：**满一页就拒绝给结论**。产物 >100 个时，
+    issue 里的「失败产物」表会**静默地列不全** —— 而那张表存在的理由正是「事后能去下载」。
+    """
+    a = api.call("GET", "repos/%s/actions/runs/%s/artifacts?per_page=%d"
+                 % (repo, run_id, ARTIFACTS_PAGE))
+    items = (a or {}).get("artifacts") or []
+    if len(items) >= ARTIFACTS_PAGE:
+        raise RuntimeError("这次 run 的产物数达到一页上限（%d）—— 「失败产物有哪些」这条"
+                           "**给不出完整结论**（同 fetch_jobs 的规矩）" % ARTIFACTS_PAGE)
+    return items
 
 
 def find_issue(api, repo, title):
     """按**标题精确相等**找已有的 issue（`state=all`，PR 不算）。
 
     ⚠️ 为什么不用 search API：它有索引延迟 —— 第一轮刚建的 issue，第二轮可能**搜不到**，
-    于是开出**第二个**。列 issue 是强一致的。
-    ⚠️ 为什么不用 `--label` 过滤：标签是后来才可能被改的（人手工去掉标签就会让去重失效），
-    而标题是**我们自己写的、逐字固定的**。
+    于是开出**第二个**。列 issue 是强一致的。两边都 `.strip()` 再比：标题由我们自己逐字写死，
+    但**人不该因为多了一个空格就让去重失效**。（标签也能被人工去掉，所以 `--label` 过滤
+    同样不可靠 —— 那是次要理由，主因是索引延迟。）
     """
     for page in range(1, ISSUE_MAX_PAGES + 1):
         items = api.call("GET", "repos/%s/issues?state=all&per_page=%d&page=%d"
@@ -458,7 +512,7 @@ def find_issue(api, repo, title):
         for it in items or []:
             if "pull_request" in it:            # issue 列表里混着 PR
                 continue
-            if (it.get("title") or "").strip() == title:
+            if (it.get("title") or "").strip() == title.strip():
                 return it
         if len(items or []) < ISSUE_PAGE:
             return None
@@ -503,6 +557,33 @@ def read_state(api, repo, branch, path, log):
     return doc.get("sha"), branch_sha, base64.b64decode(doc.get("content") or "").decode("utf-8")
 
 
+def verify_marker(api, repo, a, sc, upstream_sha, today, log):
+    """写完之后**回读**：这份标记真的会让检测器判 `blacklisted` 吗？
+
+    ⚠️ 这一条不是仪式。`failed.upstream` 与上游 HEAD 是**精确相等**比较，
+    而 issue 正文里那句「7 天内不会再触发构建」是**对外的承诺** ——
+    没有这条回读，「说了会拉黑」就只是一句话。
+    （同 #9 的那处 P0：把「要推的 = 编过的」变成一条**会响**的检查，而不是文档里的一句宣称。）
+    """
+    _, _, text = read_state(api, repo, a.heartbeat_branch, a.state_path, log)
+    if not text:
+        raise RuntimeError("刚写完失败标记，但 %s 上的状态文件**读不回来** —— "
+                           "「7 天内不会再触发构建」这句话没有依据" % a.heartbeat_branch)
+    path = os.path.join(tempfile.gettempdir(), "report-failure-verify.json")
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    # ⚠️ 用**消费者自己的代码**（`sync-check.py`）来判，而不是在本文件里另写一遍规则
+    oc = sc.check(upstream_sha, upstream_sha, upstream_sha, path, today)
+    if not oc.blacklisted:
+        raise RuntimeError(
+            "回读复核没过：这份标记**不会**让检测器判 blacklisted（它判成了 %s）⇒\n"
+            "    issue 里那句「7 天内不会再触发构建」是假的。按「叫不到人就绝不放行」，"
+            "这里必须失败。\n"
+            "    最可能的原因：写进 `failed.upstream` 的值与上游 HEAD 不是**同一个 sha**"
+            "（大小写 / 空白 / 短 sha / 记的是别的提交）。" % oc.state)
+    log("✅ 回读复核：这份标记确实会让 sync-check 判 blacklisted（退出码 20）")
+
+
 def run(a, api, log=print, dm=None, today=None):
     """一次失败上报。返回结果字典（`--json-out` 与 `--summary` 都从它来）。"""
     dm = dm or _load_sibling("dm", "detect.py")
@@ -511,13 +592,21 @@ def run(a, api, log=print, dm=None, today=None):
     dm.assert_state_path(a.state_path)
     today = today or datetime.datetime.utcnow().date()
 
+    # ⚠️ **上游提交是唯一会喂给判据的 sha ⇒ 它必须过形状守卫**（见 `assert_sha`）。
+    #    另两个（合并提交 / 合并基点）只进正文与 JSON，是**说明性**的：
+    #    对它们硬失败会变成「叫不到人」，那是更坏的失败方向 ⇒ 只做空白归一。
+    if a.upstream_sha:
+        a.upstream_sha = assert_sha("--upstream-sha", a.upstream_sha)
+    for k in ("merge_sha", "merge_base", "base_sha256"):
+        setattr(a, k, (getattr(a, k) or "").strip())
+
     r = {"repo": a.repo, "run_id": a.run_id, "run_url": a.run_url,
-         "upstream_sha": (a.upstream_sha or "").lower(), "merge_sha": a.merge_sha,
+         "upstream_sha": a.upstream_sha, "merge_sha": a.merge_sha,
          "merge_base": a.merge_base, "base_sha256": a.base_sha256,
          "work_branch": a.work_branch, "heartbeat_branch": a.heartbeat_branch,
          "state_path": a.state_path, "today": today.isoformat(),
          "dry_run": bool(a.dry_run), "expire_days": sc.EXPIRE_DAYS,
-         "marker": None, "marker_changed": False, "marker_note": None,
+         "marker": None, "marker_changed": False, "marker_note": None, "marker_how": None,
          "issue": None, "issue_action": None,
          "artifacts": [], "verdict": None, "reason": None, "exit_code": EXIT_OK}
 
@@ -595,7 +684,8 @@ def run(a, api, log=print, dm=None, today=None):
     if existing:
         n = existing["number"]
         api.call("POST", "repos/%s/issues/%d/comments" % (a.repo, n),
-                 {"body": failed_comment(a, v, r["artifacts"], mk.note)})
+                 {"body": failed_comment(a, v, r["artifacts"], mk.note, sc.EXPIRE_DAYS,
+                                         count=n_seen)})
         r["issue_action"] = "commented"
         log("✅ 已把这次失败**追加为评论**到 issue #%d（%s）—— 同一个上游提交只开一个 issue"
             % (n, existing.get("state")))
@@ -604,7 +694,7 @@ def run(a, api, log=print, dm=None, today=None):
             api.call("PATCH", "repos/%s/issues/%d" % (a.repo, n), {"state": "open"})
             log("   ⚠️ 它此前是关闭的 ⇒ 已**重新打开**（关掉的 issue 不会提醒任何人）")
     else:
-        body = issue_body(a, v, r["artifacts"], mk.note, sc.EXPIRE_DAYS, count=n_seen)
+        body = issue_body(a, v, r["artifacts"], mk.note, sc.EXPIRE_DAYS)
         doc = post_issue(api, a.repo, title, body, log)
         r["issue"] = doc.get("number")
         r["issue_action"] = "created"
@@ -625,6 +715,10 @@ def run(a, api, log=print, dm=None, today=None):
     else:
         r["marker_line"] = "⏸ **没写**（%s）" % mk.note
         log("⏸ 没有写标记：%s" % mk.note)
+
+    # ── ⑤ 回读复核：**这份标记真的会让检测器判 blacklisted 吗？** ────────────────────
+    #    （见 verify_marker 的注释：issue 里那句「7 天内不会再触发构建」是承诺，必须核过。）
+    verify_marker(api, a.repo, a, sc, r["upstream_sha"], today, log)
 
     r["issue_line"] = ("#%s（%s）" % (r["issue"], "新建" if r["issue_action"] == "created"
                                      else "追加评论"))
@@ -647,6 +741,11 @@ class FakeApi:
     """假 API：**只认实现真正用到的那些端点**，其余一律抛错（多调一个端点就是实现跑偏）。
 
     记下每一次调用与每一次写：不变量 ①（只写心跳分支）在自测里是**断言**，不是注释。
+
+    ⚠️ 写进去的内容要**真的落进 `self.state`**：`run()` 末尾有一次**回读复核**
+    （`verify_marker()`，用 `sync-check.py` 自己的判据再判一遍）。假 API 若只记下 payload
+    而不更新状态，那次回读读到的就是**旧内容**，自测会红在一个假问题上 ——
+    而如果为了让它绿去把关掉回读，那条复核就白写了。
     """
 
     def __init__(self, jobs, artifacts=(), branch_sha="c0mmit", state=None,
@@ -659,7 +758,10 @@ class FakeApi:
         self.fail_issue_always = fail_issue_always
         # `posts` 只记**成功**的写（断言「只发了一次评论」用它）；
         # `post_tries` 记**尝试**次数（断言「非 422 不许重试」用它）。
+        # ⚠️ `comments` 与 `posts` **分开**：评论与「建 issue」是两条不同的通路，
+        #    混在一个列表里会让「只追加了评论」这种断言变成一句空话（code-review 抓到过）。
         self.calls, self.puts, self.posts, self.patches = [], [], [], []
+        self.comments = []
         self.post_tries, self.wrote = 0, False
 
     def call(self, method, path, payload=None, allow_404=False):
@@ -701,7 +803,7 @@ class FakeApi:
             self.posts.append(payload)
             return {"number": 77, "html_url": "https://example/i/77"}
         if method == "POST" and "/comments" in p:
-            self.posts.append(payload)
+            self.comments.append(payload)               # 与 `posts`（含建 issue）分开记
             return {"id": 1}
         if method == "PATCH" and "/issues/" in p:
             self.patches.append(payload)
@@ -709,8 +811,12 @@ class FakeApi:
         if method == "PUT" and "/contents/" in p:
             self.puts.append(payload)
             self.wrote = True
+            # ⚠️ 内容与**分支**都要真的落进状态（回读复核读的就是它们），见类文档
+            self.state = base64.b64decode(payload["content"]).decode("utf-8")
+            self.branch_sha = self.branch_sha or "commit-new"
             return {"content": {"sha": "new"}}
         if method == "POST" and p.endswith("/git/blobs"):
+            self.state = payload["content"]          # 孤儿分支那条路：blob 就是新状态
             return {"sha": "blob-new"}
         if method == "POST" and p.endswith("/git/trees"):
             return {"sha": "tree-new"}
@@ -718,6 +824,7 @@ class FakeApi:
             return {"sha": "commit-new"}
         if method == "POST" and p.endswith("/git/refs"):
             self.wrote = True
+            self.branch_sha = "commit-new"           # 孤儿分支建出来了 ⇒ 分支从此存在
             return {"ref": payload["ref"]}
         raise AssertionError("假 API 不认识这个端点：%s %s" % (method, path))
 
@@ -745,7 +852,8 @@ def _quiet(*_a, **_kw):
     pass
 
 
-# 22 条用例。前六条各自钉住一种**结论**（其中三种是「什么都不写」），后面钉细节。
+# 表驱动用例：前六条各自钉住一种**结论**（其中三种是「什么都不写」），后面钉细节。
+# ⚠️ 条数**不写在注释里** —— 它已经错过一次（写「22 条」而实际 31 条）。看 `--self-test` 自报的数。
 CLASSIFY_CASES = [
     ("① 编译真失败 ⇒ reported",
      [_job("prepare", "success"), _job("build", "failure", [(12, "Build", "failure")]),
@@ -766,13 +874,17 @@ CLASSIFY_CASES = [
 #        而同一轮里 prepare 真红了 ⇒ 该报。把 skipped 当成「红过」或「没红过」都是错的。
 
 
-def self_test(tmpdir):
+def self_test():
     """离线用例。返回失败条数。
 
     **测的是编排**：判定（`classify` 与 `new_failed_state` 都是纯函数）与写路径
-    （只写心跳分支、先 issue 后标记、dry-run 一条写请求都不发）。
+    （只写心跳分支、先 issue 后标记、写后回读复核、dry-run 一条写请求都不发）。
+
+    ⚠️ **没有 `--self-test-dir`**（同族的 `detect.py` / `sync-check.py` 有）：那两个工具
+    的自测要往磁盘上落真文件（marker / 夹具），本工具的自测**全是纯函数 + 假 API** ——
+    留一个不收不用的目录参数就是一处「只写不读」，本仓库对那一族点过两次名。
+    （唯一落盘的地方是 `verify_marker()` 的临时文件，那是**生产路径**要的，与自测无关。）
     """
-    os.makedirs(tmpdir, exist_ok=True)
     bad, n = 0, 0
 
     def fail(what, *lines):
@@ -865,6 +977,11 @@ def self_test(tmpdir):
         ("⑮ 保留 heartbeat（本工具不写心跳）",
          '{"failed": null, "heartbeat": {"at": "2026-09-27", "upstream": "%s"}}' % ("8" * 40),
          UP, True, "保留"),
+        # ⚠️ `at` 写坏 + 同一个上游提交：`sync-check` 对同样的坏法判「损坏 ⇒ **不拉黑**」，
+        #    所以这里必须**重新起算**（而措辞不能说成「已过期」—— 那不是事实）。
+        ("⑮b 同一提交但 `at` 读不出 ⇒ 重新起算（不许说「已过期」）",
+         '{"failed": {"upstream": "%s", "at": "2026/09/27"}, "heartbeat": {"at": "2026-09-27"}}'
+         % UP, UP, True, "读不出"),
     ]
     for what, old, up, want_changed, keyword in cases:
         n += 1
@@ -906,16 +1023,44 @@ def self_test(tmpdir):
         else:
             ok("⑯ 附属：正文含上游提交号与失败环节", "（%d 字节）" % len(body))
 
+    # ★ 标题的字面形状：**不许用 `issue_title()` 现算**（那会夹具与实现同源：
+    #   标题哪天退化成不含 sha，去重就变成「所有上游共用一个 issue」，而用例照样全绿）。
+    n += 1
+    want_title = "[上游同步] 失败：上游 %s" % UP[:12]
+    if issue_title(UP) != want_title or api.posts[0]["title"] != want_title:
+        fail("⑯b 标题必须是 `[上游同步] 失败：上游 <12 位短 sha>`（字面量钉住）",
+             "issue_title=%r，实际 %r" % (issue_title(UP), api.posts[0].get("title")))
+    else:
+        ok("⑯b 标题形状（字面量，不靠现算）", "-> %s" % want_title)
+
+    # ★ 写标记那次提交的提交信息：`message=` 这个参数存在的**全部理由**就是它 ——
+    #   不钉住的话，实现哪天退回「心跳那条信息」，31 条用例照样全绿（code-review 抓到）。
+    n += 1
+    msg = (api.puts[0].get("message") or "") if api.puts else ""
+    if UP[:12] not in msg or "拉黑" not in msg or "7 天" not in msg:
+        fail("⑯c 写标记的提交信息要说清「拉黑了谁、多久过期」", "实际：%r" % msg[:80])
+    else:
+        ok("⑯c 提交信息含短 sha + 拉黑 + 7 天", "-> %s" % msg.split("\n")[0][:34])
+
     r, api = case("⑰ 已有同名 issue（开着）⇒ **只追加评论**，不新建", FAIL,
                   (V_REPORTED, "commented", True), branch_sha="c0mmit", state=HB,
                   issues=[{"number": 12, "title": issue_title(UP), "state": "open", "comments": 0}])
     n += 1
+    # ⚠️ 断言要钉在**评论那条通路**上：第一版写的是 `"issues" not in api.calls[-1]`，
+    #    而那一刻最后一条调用是写标记之后的 `GET /git/trees/…` —— 一个恒真的空断言
+    #    （即使真开出第二个 issue 也照样通过）。见自测里那份「空集合 ≠ 没给条件」的教训（坑表 #35）。
     if r is None:
         pass
-    elif api.posts and "issues" not in api.calls[-1]:
-        ok("⑰ 附属：只发了一次评论请求", "-> issue #%s" % r["issue"])
+    elif len(api.comments) == 1 and not any("POST repos/o/r/issues" == c for c in api.calls):
+        cbody = api.comments[0]["body"]
+        miss = [w for w in (UP[:12], "第 12 步", "Build", "第 2 次") if w not in cbody]
+        if miss:
+            fail("⑰ 附属：评论正文也要含上游提交号与失败环节", "缺：%s" % miss)
+        else:
+            ok("⑰ 附属：恰好一条评论，且含 sha + 失败环节 + 第 N 次", "-> issue #%s" % r["issue"])
     else:
-        fail("⑰ 附属：应当只追加评论", api.posts)
+        fail("⑰ 附属：应当**恰好一次**评论、且不新建 issue",
+             "comments=%d，calls=%s" % (len(api.comments), api.calls[-2:]))
 
     case("⑱ 已有同名 issue（**关着**）⇒ 追加评论并重新打开", FAIL,
          (V_REPORTED, "commented", True), branch_sha="c0mmit", state=HB,
@@ -1013,6 +1158,10 @@ def self_test(tmpdir):
 def main(argv):
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    # ⚠️ 先加载 `detect.py`：下面两个默认值要从**它**取（心跳分支名与状态文件路径在那边定义）。
+    #    各自再写一份字面量＝同一个事实两处各记一份 —— 而本文件已经在从 `sync-check.py` 取
+    #    `EXPIRE_DAYS`、从 `detect.py` 取 `Api`/`write_state`，这里没有理由例外。
+    dm = _load_sibling("dm", "detect.py")
     ap = argparse.ArgumentParser(
         add_help=True, description="失败上报（红了叫人与拉黑，见文件头）",
         epilog="退出码：0 已处置（四种结论都是正常结局）/ 1 运行错误 / 2 用法错误")
@@ -1020,37 +1169,34 @@ def main(argv):
     ap.add_argument("--run-id", metavar="ID", help="出问题的那次 run 的数字 id")
     ap.add_argument("--run-url", metavar="URL", help="那次运行的 URL（写进 issue 与摘要）")
     ap.add_argument("--upstream-sha", metavar="SHA", default="",
-                    help="这次构建对应的**上游提交**（拉黑的对象；留空 = 手动触发的运行）")
+                    help="这次构建对应的**上游提交**（拉黑的对象，必须 40 位；留空 = 手动触发的运行）")
     ap.add_argument("--merge-sha", metavar="SHA", default="", help="那次试合并的合并提交（进正文）")
     ap.add_argument("--merge-base", metavar="SHA", default="", help="那次合并的基点（进正文）")
     ap.add_argument("--base-sha256", metavar="SHA", default="", help="那次用的底包 sha256（进正文）")
     ap.add_argument("--work-branch", metavar="分支", default="ksu-lineage-23.2",
                     help="工作分支（**只读它**，写它一次都算事故）")
-    ap.add_argument("--heartbeat-branch", metavar="分支", default="sync-heartbeat",
-                    help="心跳分支（失败标记写在它的状态文件里）")
-    ap.add_argument("--state-path", metavar="路径", default="sync-state.json",
-                    help="心跳分支上的状态文件（默认 sync-state.json）")
+    ap.add_argument("--heartbeat-branch", metavar="分支", default=dm.HEARTBEAT_BRANCH,
+                    help="心跳分支（失败标记写在它的状态文件里；默认取 detect.py 的常量）")
+    ap.add_argument("--state-path", metavar="路径", default=dm.STATE_PATH,
+                    help="心跳分支上的状态文件（默认取 detect.py 的常量）")
     ap.add_argument("--self-job", metavar="名字", default=os.environ.get("GITHUB_JOB"),
                     help="**本工具自己所在的 job**（它的结论此刻还是 null，不能漏掉它的失败步骤；"
-                         "CI 上默认取 GITHUB_JOB）")
+                         "CI 上默认取 GITHUB_JOB，两个 workflow 因此**不必**各记一份 job 名）")
     ap.add_argument("--today", metavar="YYYY-MM-DD", help="「今天」（默认取 UTC 当天）")
     ap.add_argument("--dry-run", action="store_true", help="判据全跑，**一条写请求都不发**")
     ap.add_argument("--json-out", metavar="文件", help="把结果写一份 JSON")
     ap.add_argument("--summary", metavar="文件", help="追加一段 Markdown（喂 $GITHUB_STEP_SUMMARY）")
     ap.add_argument("--self-test", action="store_true", help="离线跑内置用例（不联网、不读参数）")
-    ap.add_argument("--self-test-dir", metavar="目录", default=None)
     a = ap.parse_args(argv[1:])
 
     if a.self_test:
-        return 1 if self_test(a.self_test_dir or
-                              os.path.join(tempfile.gettempdir(), "report-failure-selftest")) else 0
+        return 1 if self_test() else 0
 
     missing = [n for n in ("repo", "run_id", "run_url") if not getattr(a, n)]
     if missing:
         print("缺必填参数: %s" % ", ".join("--" + m.replace("_", "-") for m in missing))
         return EXIT_USAGE
 
-    dm = _load_sibling("dm", "detect.py")
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if not token and not a.dry_run:
         print("⚠️  没有 GH_TOKEN / GITHUB_TOKEN：读接口是公开的，但**写与开 issue 会 403**。")
