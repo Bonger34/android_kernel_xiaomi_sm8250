@@ -76,13 +76,10 @@ import json
 import os
 import sys
 import tempfile
-import urllib.error
 import urllib.parse
-import urllib.request
 from typing import NamedTuple
 
 WS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-UA = "umi-loskernel-report-failure/1"
 
 EXIT_OK = 0
 EXIT_RUN_ERROR = 1
@@ -335,6 +332,7 @@ def issue_body(a, verdict, artifacts, marker_note, expire_days, count=1):
          "| 工作分支 | `%s`（**一个字节都没动**） |" % a.work_branch,
          "| 合并提交 | %s |" % ("`%s`（不在任何分支上 —— 全绿才会推）" % a.merge_sha
                                 if a.merge_sha else "（本次没有合并）"),
+         "| 合并基点 | %s |" % ("`%s`" % a.merge_base if a.merge_base else "（未记录）"),
          "| 底包 sha256 | %s |" % ("`%s`" % a.base_sha256 if a.base_sha256 else "（未记录）"),
          "| 失败标记 | %s |" % ("`failed.upstream = %s`（%s）" % (short(a.upstream_sha), marker_note)
                                 if a.upstream_sha else "（没有上游提交可记）"),
