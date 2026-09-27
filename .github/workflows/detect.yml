@@ -39,6 +39,12 @@
 #     让那个提交经过一条 ref 之后它才成为服务端对象 —— 而那一条**绝不是工作分支**。
 #     ℹ️ 这处决定改了规格里「试合并**绝不 push**」那句字面约束（用户 2026-09-27 裁定，方案 A）；
 #        它的**目的**（工作分支不提前前进）完整保住，且工作分支那一步**永远** `force: false`。
+#
+#  ⚠️ #10 起本文件**红了会自己叫人**：末尾多了一步 `if: failure()`，
+#     用同一个 `report-failure.py` 开 issue（**检测器自身失败最常见的就是试合并冲突**，
+#     而冲突**不会自己消失** —— 没有这一步的话，那个上游提交会让每一天都红一次，
+#     直到有人碰巧看见）。它同时会把「这个上游提交已试过」记进失败标记，
+#     于是 7 天内不再为它重复跑检测（过期后自动重试）。
 # ══════════════════════════════════════════════════════════════════════════════
 name: Detect upstream drift (heartbeat + drift)
 
@@ -67,9 +73,12 @@ on:
 #    `contents: write` 是写心跳分支要的（`contents: read` 已经含在里面，checkout 也要它）。
 #    `actions: write` 是 #8 用 `GITHUB_TOKEN` 触发构建器要的
 #    （缺了就是 403 `Resource not accessible by integration`，规格实现决定 1 的原话）。
+#    `issues: write` 是 #10 的失败上报要的（开 issue / 追加评论）——
+#    ⚠️ `actions: write` 只覆盖 actions 那一族，**不含** issue。
 permissions:
   contents: write
   actions: write
+  issues: write
 
 # 一天一次 + 随时可能手动触发：两次同时跑会撞同一份状态文件。CAS 会让后者响亮地 409
 # （不会互相覆盖，这一点是好的），但那是一次没必要的红。排队等一下比丢掉一次好。
@@ -439,3 +448,39 @@ jobs:
           { echo ""; echo "### 收尾"; echo ""
             echo "✅ \`$WORK_BRANCH\` 从头到尾是 \`$NOW\` —— 检测器**一个字节都没推**。"
             echo "（推分支是构建器在全绿之后做的：issue #9。）"; } >> "$GITHUB_STEP_SUMMARY"
+
+      # ══ #10：红了叫人 ═════════════════════════════════════════════════════════
+      # **检测器自身失败也要叫人。** 最常见的形态是**试合并冲突**（fixture `sync-conflict-sim`
+      # 那一次的 run 36270791644 就是：红的，而**没有任何人被叫** —— 那正是 #10 的活）。
+      #
+      # 为什么这一档比构建失败**更**需要自动通知：冲突**不会自己消失**，而检测器每天跑一次
+      # ⇒ 没有这一步就变成「同一个上游提交每天都红一次」，直到有人碰巧打开 Actions 页面。
+      # 记下失败标记之后，7 天内不再为它重复跑（过期后自动重试）。
+      #
+      # ⚠️ 与构建器那条路的**唯一**区别：这里没有产物（检测器不编译），
+      #    issue 正文会如实写「这次没有产物」。其余完全相同：同一个工具、同一份标记、同一套去重。
+      #
+      # ⚠️ `--upstream-sha` 取自**检测那一步**的输出：若失败发生在检测那一步**本身**
+      #    （例如 API 抖动 / 限流），它是空的 ⇒ 工具判 `no-upstream` 并**什么都不做**。
+      #    那是有意的：一次网络抖动不该开 issue，也不该让某个提交被拉黑 7 天
+      #    （规格实现决定 7：基础设施抖动会自动重试）。
+      - name: "红了叫人：检测器自身失败也开 issue（冲突无法自愈，#10）"
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/report-failure.py \
+            --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --self-job detect \
+            --upstream-sha "${{ steps.detect.outputs.upstream_sha }}" \
+            --merge-sha "${{ steps.merge.outputs.merge_sha }}" \
+            --merge-base "${{ steps.detect.outputs.merge_base }}" \
+            --work-branch "$WORK_BRANCH" \
+            --heartbeat-branch "$HEARTBEAT_BRANCH" \
+            --json-out report-failure.json \
+            --summary "$GITHUB_STEP_SUMMARY"
+          echo "──────── 机器可读的结果（report-failure.json）────────"
+          cat report-failure.json
+          echo "───────────────────────────────────────────────"
