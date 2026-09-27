@@ -1,0 +1,1 @@
+third fixture commit: acceptance run on the FINAL bytes of issue #10.
