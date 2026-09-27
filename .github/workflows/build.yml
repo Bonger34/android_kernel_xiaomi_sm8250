@@ -38,10 +38,6 @@ on:
         description: "本批次对应的上游提交（规格 §5 来源说明四项之一；留空 = 未记录，手动触发就是这样）"
         required: false
         default: ""
-      local_sha:
-        description: "【上游同步通道】试合并时**本线 HEAD** 是哪一个提交。#9 起用于推分支前的复核：它必须等于合并提交的**父[0]**，否则一个请求都不发（留空 = 不推分支）"
-        required: false
-        default: ""
       merge_sha:
         description: "【上游同步通道】要在本线 HEAD 上重放的**合并提交**（检测器试合并算出来的）。留空 = 不合并，直接编分支 HEAD —— 手动触发就是这样"
         required: false
@@ -68,9 +64,13 @@ on:
 #    upstream_sha   上游那个提交
 #    merge_base     那个合并的基点（API 的权威值）
 #    merge_sha      合并提交 —— **两个 build job 各自重放它并断言 sha 相同**
-#    local_sha      **本线 HEAD**（试合并的父[0]）—— #9 起推分支前要核它
 #    base_run_id / base_artifact   检测器取的那份底包（`prepare` 复用它，不自己现拉）
 #    base_sha256    检测器算出的底包哈希（`prepare` 复算一遍交叉验证）
+#
+#  ⚠️ **#9 的推分支不需要新入参**：它要的「试合并时的本线 HEAD」就是合并提交的
+#     **父[0]**，那一步从对象里现取（`git rev-parse "$MSHA^1"`）。
+#     这不是省事 —— 本工单实测：另加一个 `local_sha` 输入之后，
+#     `workflow_dispatch` 的 inputs 超限，检测器派发**当场 422**。
 #
 #  ⚠️ **手动触发仍然是完整可用的兜底入口**（规格实现决定 1）：那几个入参全留空即可，
 #     此时本 workflow 的行为与 #7 之前**一模一样**（编分支 HEAD，不合并）。
@@ -600,9 +600,14 @@ jobs:
       contents: write
       actions: read
     steps:
+      # ⚠️ `fetch-depth: 0`（完整历史）是给 #9 的推分支那一步准备的：
+      #    它要在**这个**检出里重放那次合并，而重放要算 merge-base
+      #    （`try-merge.py` 会按代价从低到高去取历史）。默认的 `fetch-depth: 1`
+      #    只有 merge 提交那一层，能不能算出共同祖先要靠运气 —— 那是**假失败**的温床。
+      #    这个 job 不编译，多取一点历史的代价可以忽略。
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: "Download both passes' artifacts (both must survive, even on failure)"
         uses: actions/download-artifact@v4
@@ -686,6 +691,11 @@ jobs:
       #    又核了一遍：`--expect-merge-sha` 不符时这一步当场失败。
       #    ⚠️ 用 `--no-checkout`：只造对象，**不移动 HEAD、不碰工作区**。
       #
+      # ⚠️ **`--merge-sha` / `--base-sha` 都从那个对象现取**，不经过任何 inputs：
+      #    「试合并时的本线 HEAD」就是合并提交的**父[0]**。
+      #    （本工单实测：给它单开一个 input 会让 `workflow_dispatch` 的 inputs 超限，
+      #      检测器派发**当场 422**。少一个能写歪的输入本来也更好。）
+      #
       # ⚠️ **这一节的 checkout 是 detached**（`ref: ${{ github.sha }}` = 合并提交），
       #    而推分支**不需要**站在那条分支上（写的是 `refs/heads/<branch>`）。
       #    第一版的 `promote.py` 加了「必须检出在 --branch 上」的守卫 ⇒ CI 上必然失败，
@@ -704,13 +714,22 @@ jobs:
             --merge-base "${{ inputs.merge_base }}" \
             --expect-merge-sha "${{ inputs.merge_sha }}"
 
+          # ⚠️ 从**对象**里取那两个 sha，不用 `${{ github.sha }}`：
+          #    `github.sha` 与「上一步重放出来的那个提交」是两件事 ——
+          #    一旦它们不同（比如再有人给 workflow 加一个 checkout ref），
+          #    下面推上去的就会是**另一个**提交，而两处看起来都「对」。
+          MSHA="$(git rev-parse HEAD)"
+          PARENT="$(git rev-parse "$MSHA^1")"
+          echo "合并提交   = $MSHA"
+          echo "父[0] 本线 = $PARENT（试合并时的本线 HEAD）"
+
           # ★ 判定与写入都在工具里（接缝 S6）。它只发**一次**写请求：
           #    `PATCH refs/heads/<分支>`，`force: false` ⇒ 非快速前进时平台自己拒。
           #    退出码 3（分支已前进）与 4（并发被抢）都是**正常结论**：这次不推，分支没动。
           python3 .github/scripts/promote.py \
             --repo "$GITHUB_REPOSITORY" --branch "$WORK_BRANCH" --repo-dir . \
-            --merge-sha "${{ inputs.merge_sha }}" \
-            --local-sha "${{ inputs.local_sha }}" \
+            --merge-sha "$MSHA" \
+            --base-sha "$PARENT" \
             --upstream-sha "${{ inputs.upstream_sha }}" \
             --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --summary "$GITHUB_STEP_SUMMARY" --github-output "$GITHUB_OUTPUT"
