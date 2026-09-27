@@ -348,8 +348,13 @@ def list_refs(api, repo):
     return {r["ref"]: r["object"]["sha"] for r in refs}
 
 
-def write_state(api, repo, branch, path, text, file_sha, branch_sha):
+def write_state(api, repo, branch, path, text, file_sha, branch_sha, message=None):
     """把状态文件写到心跳分支上。返回这次走的是哪条路。
+
+    ⚠️ **`message` 是可传的**：这个文件有**两个 writer**（本工具写 `heartbeat`，
+    `report-failure.py` 写 `failed`），而两者该留的提交信息完全不同 ——
+    证物是「谁在什么时候动了这个文件」，一条写成心跳的提交信息会让人查错方向。
+    不给就仍然用心跳那条（保持本文件原有的行为不变）。
 
     三条真实状态 ⇒ 两条代码路径（第三条是 code-review 之后并进来的，见下）：
 
@@ -367,21 +372,22 @@ def write_state(api, repo, branch, path, text, file_sha, branch_sha):
     """
     if file_sha:
         api.call("PUT", "repos/%s/contents/%s" % (repo, qp(path)),
-                 {"message": HEARTBEAT_MSG % _date_of(text), "content": _b64(text),
+                 {"message": message or (HEARTBEAT_MSG % _date_of(text)), "content": _b64(text),
                   "sha": file_sha, "branch": branch})
         return "contents"
     if branch_sha:
         # ⚠️ **不给 `sha`**：给了会被当作「改一个不存在的文件」，不给才是「建」。
         #    若另一轮抢先建出来了，这次会 422 —— 那是我们要的失败方向。
         api.call("PUT", "repos/%s/contents/%s" % (repo, qp(path)),
-                 {"message": HEARTBEAT_MSG % _date_of(text), "content": _b64(text),
+                 {"message": message or (HEARTBEAT_MSG % _date_of(text)), "content": _b64(text),
                   "branch": branch})
         return "create"
     blob = api.call("POST", "repos/%s/git/blobs" % repo, {"content": text, "encoding": "utf-8"})
     tree = {"tree": [{"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]}]}
     t = api.call("POST", "repos/%s/git/trees" % repo, tree)
     c = api.call("POST", "repos/%s/git/commits" % repo,
-                 {"message": HEARTBEAT_MSG % _date_of(text), "tree": t["sha"], "parents": []})
+                 {"message": message or (HEARTBEAT_MSG % _date_of(text)),
+                  "tree": t["sha"], "parents": []})
     api.call("POST", "repos/%s/git/refs" % repo,
              {"ref": "refs/heads/" + branch, "sha": c["sha"]})
     return "orphan"
