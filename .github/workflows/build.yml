@@ -360,7 +360,7 @@ jobs:
   build:
     needs: prepare
     runs-on: ubuntu-22.04
-    timeout-minutes: 1   # 🚨 临时探针（issue #10 的验收：造一次**超时**，看它算不算失败）—— 跑完立刻改回 180
+    timeout-minutes: 180
     strategy:
       # ⚠️ max-parallel=1 是**故意的**：两次编译必须落在**两个不同的 runner** 上
       #    （并行也行，但那要多占一份并发额度；串行的总时长仍在那条 3 小时的超时内）。
