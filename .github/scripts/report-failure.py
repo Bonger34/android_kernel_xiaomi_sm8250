@@ -470,13 +470,22 @@ def find_issue(api, repo, title):
 
 
 def post_issue(api, repo, title, body, log):
-    """开 issue。⚠️ 标签**不是**硬要求：它不存在时不该丢掉一次通知。"""
+    """开 issue。⚠️ 标签**不是**硬要求：它不存在时不该丢掉一次通知。
+
+    ⚠️ **只在 HTTP 422 上重试**（标签 / 参数校验类错误），别的异常**原样抛出去**。
+    第一版是 `except Exception` —— 那在网络超时上会**开出两个 issue**：
+    请求可能已经在服务端成功了，只是响应没回来。窄判据的代价只是「标签问题被多试一次」，
+    而宽判据的代价是**重复通知**（正是去重要防的东西）。
+    抛出去之后：工具退出码 1 ⇒ 一个字节都不写 ⇒ 下一轮重试，而去重按标题仍然有效。
+    """
     payload = {"title": title, "body": body, "labels": [ISSUE_LABEL]}
     try:
         return api.call("POST", "repos/%s/issues" % repo, payload)
-    except Exception as e:                       # 标签被删 / 改名 / 权限不足
-        log("⚠️ 带标签 %r 建 issue 失败（%s）⇒ 去掉标签重试一次："
-            "**一次通知不该因为一个标签丢掉**" % (ISSUE_LABEL, str(e).split("\n")[0]))
+    except Exception as e:                       # 标签被删 / 改名 / 校验不过
+        if "HTTP 422" not in str(e):
+            raise
+        log("⚠️ 带标签 %r 建 issue 失败（HTTP 422）⇒ 去掉标签重试一次："
+            "**一次通知不该因为一个标签丢掉**" % ISSUE_LABEL)
         payload.pop("labels")
         return api.call("POST", "repos/%s/issues" % repo, payload)
 
@@ -643,13 +652,17 @@ class FakeApi:
     """
 
     def __init__(self, jobs, artifacts=(), branch_sha="c0mmit", state=None,
-                 issues=(), repo="o/r", fail_issue_with_label=False):
+                 issues=(), repo="o/r", fail_issue_with_label=False, fail_issue_always=None):
         self.jobs, self.artifacts = jobs, list(artifacts)
         self.branch_sha, self.state = branch_sha, state
         self.issues = list(issues)
         self.repo = repo
         self.fail_issue_with_label = fail_issue_with_label
-        self.calls, self.puts, self.posts, self.patches, self.wrote = [], [], [], [], False
+        self.fail_issue_always = fail_issue_always
+        # `posts` 只记**成功**的写（断言「只发了一次评论」用它）；
+        # `post_tries` 记**尝试**次数（断言「非 422 不许重试」用它）。
+        self.calls, self.puts, self.posts, self.patches = [], [], [], []
+        self.post_tries, self.wrote = 0, False
 
     def call(self, method, path, payload=None, allow_404=False):
         p = path.split("?")[0]
@@ -682,6 +695,9 @@ class FakeApi:
                 return self.issues
             raise AssertionError("假 API 不认识这个端点：%s %s" % (method, path))
         if method == "POST" and p.endswith("/issues"):
+            self.post_tries += 1
+            if self.fail_issue_always:
+                raise RuntimeError(self.fail_issue_always)
             if self.fail_issue_with_label and payload and payload.get("labels"):
                 raise RuntimeError("HTTP 422（模拟：标签不存在 / 无权限）")
             self.posts.append(payload)
@@ -945,12 +961,25 @@ def self_test(tmpdir):
     api = FakeApi(FAIL, branch_sha="c0mmit", state=HB, fail_issue_with_label=True)
     try:
         r = run(_args(), api, log=_quiet, today=TODAY)
-        if r["issue_action"] != "created" or api.posts[0].get("labels"):
-            fail("㉔ 标签不可用 ⇒ 去掉标签重试（一次通知不该因标签丢掉）", api.posts)
+        if r["issue_action"] != "created" or api.posts[0].get("labels") or api.post_tries != 2:
+            fail("㉔ 标签不可用 ⇒ 去掉标签重试（一次通知不该因标签丢掉）", api.posts, api.post_tries)
         else:
             ok("㉔ 标签不可用 ⇒ 去掉标签重试一次", "-> issue #%s" % r["issue"])
     except Exception as e:
         fail("㉔ 标签不可用 ⇒ 去掉标签重试（一次通知不该因标签丢掉）", "抛异常：%r" % (e,))
+
+    # ── 但**非 422** 的失败不许重试：那会在网络超时上开出第二个 issue ──────────────
+    n += 1
+    api = FakeApi(FAIL, branch_sha="c0mmit", state=HB, fail_issue_always="HTTP 500 服务端炸了")
+    try:
+        run(_args(), api, log=_quiet, today=TODAY)
+        fail("㉔b 非 422 的建 issue 失败 ⇒ **不许**重试", "没抛异常")
+    except Exception as e:
+        if api.post_tries != 1 or "500" not in str(e):
+            fail("㉔b 非 422 的建 issue 失败 ⇒ 不重试、原样抛出",
+                 "尝试 %d 次；异常 %r" % (api.post_tries, e))
+        else:
+            ok("㉔b 非 422（500）⇒ 不重试、原样抛出", "尝试 1 次")
 
     # ── 分支 / 文件都不存在（首次）：走孤儿提交那条路 ──────────────────────────
     n += 1
