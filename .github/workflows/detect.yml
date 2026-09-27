@@ -302,27 +302,26 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # ★ 八个入参**一个都不能空**：空的 `merge_sha` 会让构建器按「不合并」跑，
+          # ★ 七个入参**一个都不能空**：空的 `merge_sha` 会让构建器按「不合并」跑，
           #   产出一批**没有上游改动**的东西，而那次运行是**绿的** —— 最坏的一种失败；
           #   空的 `upstream_url` 会让构建侧重放合并时去默认的 LineageOS 仓库取那个 sha，
           #   而上游换成别的仓库（本文件的测试钩子）时**那就取不到**。
-          #   ⚠️ #9 起多一个 `local_sha`：**推分支前要核它等于合并提交的父[0]** ——
-          #   空值会让那一步直接跳过（构建器的 if 就挂在 merge_sha 上），
-          #   于是「全绿才推分支」悄悄不生效，而整次运行照样是绿的。
           #   `--require` 就是为这些设的：缺一个就**一个请求都不发**（退出码 2）。
+          #
+          # ⚠️ **#9 的推分支核的「本线 HEAD」不在这里传**：它就是合并提交的**父[0]**，
+          #   构建器那一步从对象里现取。本工单实测过「单开一个 input」那条路 ——
+          #   `workflow_dispatch` 的 inputs 超限，**这次派发当场 422**。
           python3 .github/scripts/trigger-build.py \
             --repo "$GITHUB_REPOSITORY" --workflow "$BUILD_WORKFLOW" --ref "$WORK_BRANCH" \
             --input upstream_sha="${{ steps.detect.outputs.upstream_sha }}" \
             --input merge_base="${{ steps.detect.outputs.merge_base }}" \
             --input merge_sha="${{ steps.merge.outputs.merge_sha }}" \
-            --input local_sha="${{ steps.detect.outputs.local_sha }}" \
             --input base_run_id="${{ github.run_id }}" \
             --input base_artifact="base-img-${{ steps.merge.outputs.merge_sha }}" \
             --input base_sha256="$(cat base.sha256)" \
             --input base_date="$(cat base.date)" \
             --input upstream_url="https://github.com/${UPSTREAM_REPO}.git" \
             --require upstream_sha --require merge_sha --require merge_base \
-            --require local_sha \
             --require base_run_id --require base_artifact --require base_sha256 \
             --require upstream_url
           { echo ""; echo "### 触发构建"; echo ""
