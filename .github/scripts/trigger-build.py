@@ -212,23 +212,46 @@ def trigger(a, api, log=print):
         log("⚠️ --dry-run：**没有派发**。上面就是将要发出的请求体。")
         return {"dispatched": False, "workflow": path, "ref": a.ref, "inputs": inputs}
 
-    st, _doc = api.call("POST", "repos/%s/actions/workflows/%s/dispatches"
+    st, doc = api.call("POST", "repos/%s/actions/workflows/%s/dispatches"
                         % (a.repo, urllib.parse.quote(a.workflow)),
                         {"ref": a.ref, "inputs": inputs})
-    if st == 403:
-        raise Usage(
-            "派发被拒（HTTP 403 `Resource not accessible by integration`）。\n"
-            "   ⇒ 最可能的原因：调用方的 `permissions:` 里**少了 `actions: write`**。\n"
-            "      规格实现决定 1 已实测过：漏了它就是这一条 403（\n"
-            "      `PROJECT.md` §7 坑表里那条「社区把它误传成平台禁止」的坑）。\n"
-            "   ⚠️ 另一个前提：一旦写了 `permissions:`，**没列出的权限一律变 none** ——\n"
-            "      检测器那边还要 `contents: write`（写心跳）与 `contents: read`（checkout）。")
-    if st == 404:
-        raise Usage("派发请求 404：workflow %r 或 ref %r 在 %s 上不存在。" % (a.workflow, a.ref, a.repo))
-    if st == 422:
-        raise Usage("派发请求 422：ref 或 inputs 不被接受（分支不存在？inputs 名写错？）。")
-    if st not in (200, 201, 204):
-        raise RuntimeError("派发返回了意外状态 HTTP %d" % st)
+    if st >= 400:
+        # 🚨 **必须把平台的 `message` 原样打出来。**
+        #    422 这一个码至少有**两种**截然不同的原因，而它们的善后完全不同：
+        #      · `Unexpected inputs provided: [...]` ⇒ 给了平台**没声明**的输入名
+        #        （`.github/workflows/<文件>` 的 `on.workflow_dispatch.inputs` 里没有它）；
+        #      · `Invalid Argument - failed to parse workflow: (Line: N, Col: M): …`
+        #        ⇒ **整个 workflow 文件**没被接受（常见真因：`run:` 块的**注释里**
+        #        写了一个不像表达式的 `${{ … }}` —— Actions 的表达式解析器扫的是全文）。
+        #    2026-09-27 做 issue #9 时，这里原先只回一句「ref 或 inputs 不被接受」，
+        #    于是同一条 422 被归因了**两次**才对上（详见 docs/los-line/tickets.md 的 #9 一节）。
+        detail = json.dumps(doc, ensure_ascii=False)[:600] if doc else "（没有正文）"
+        if st == 403:
+            raise Usage(
+                "派发被拒（HTTP 403 `Resource not accessible by integration`）。\n"
+                "   ⇒ 最可能的原因：调用方的 `permissions:` 里**少了 `actions: write`**。\n"
+                "      规格实现决定 1 已实测过：漏了它就是这一条 403（\n"
+                "      `PROJECT.md` §7 坑表里那条「社区把它误传成平台禁止」的坑）。\n"
+                "   ⚠️ 另一个前提：一旦写了 `permissions:`，**没列出的权限一律变 none** ——\n"
+                "      检测器那边还要 `contents: write`（写心跳）与 `contents: read`（checkout）。\n"
+                "   平台原文：%s" % detail)
+        if st == 404:
+            raise Usage("派发请求 404：workflow %r 或 ref %r 在 %s 上不存在。\n   平台原文：%s"
+                        % (a.workflow, a.ref, a.repo, detail))
+        if st == 422:
+            raise Usage(
+                "派发请求 422：平台不接受这次请求。**下面这一行才是真因** ——\n"
+                "   `Unexpected inputs provided: [...]`\n"
+                "       ⇒ 给了平台**没声明**的输入名（`on.workflow_dispatch.inputs` 里没有它）。\n"
+                "          本项目踩过：给 build.yml 加了个 `local_sha` 输入，而平台认定它不存在\n"
+                "          （`docs/los-line/tickets.md` 的 #9 一节）。\n"
+                "   `Invalid Argument - failed to parse workflow: (Line: N, Col: M): …`\n"
+                "       ⇒ **整个 workflow 文件**没被接受，与 inputs 无关。\n"
+                "          常见真因：`run:` 块的**注释里**写了一个不像表达式的 `${{ … }}` ——\n"
+                "          Actions 的表达式解析器扫的是 `run:` 全文（连注释也算）。\n"
+                "          本机先跑 `python tools/check-workflow.py <workflow 所在目录>`。\n"
+                "   平台原文：%s" % detail)
+        raise RuntimeError("派发返回了意外状态 HTTP %d：%s" % (st, detail))
     log("✅ 已派发：%s @ %s（HTTP %d）" % (path, a.ref, st))
     log("   看这次运行：https://github.com/%s/actions/workflows/%s" % (a.repo, a.workflow))
     log("   ⚠️ dispatch 接口**不返回 run id** —— 「哪一次」靠时间 + head 提交去对（#10 会用到）。")
@@ -244,9 +267,12 @@ def trigger(a, api, log=print):
 # ══════════════════════════════════════════════════════════════════════════════
 class FakeApi:
     def __init__(self, wf_state="active", wf_http=200, on_default=True, post_status=204,
-                 default_branch="ksu-lineage-23.2"):
+                 default_branch="ksu-lineage-23.2", post_body=None):
         self.wf_state, self.wf_http, self.on_default = wf_state, wf_http, on_default
         self.post_status, self.default_branch = post_status, default_branch
+        # ⚠️ `post_body` 让负向用例能把**平台的原文**放进响应里 ——
+        #    422 有两种截然不同的原因，而它们**只能靠 message 分辨**（本工单真踩过）。
+        self.post_body = post_body or {}
         self.calls, self.posts = [], []
 
     def call(self, method, path, payload=None):
@@ -261,7 +287,7 @@ class FakeApi:
             return (200, {"name": "build.yml"}) if self.on_default else (404, {"message": "Not Found"})
         if method == "POST" and path.endswith("/dispatches"):
             self.posts.append(payload)
-            return self.post_status, {}
+            return self.post_status, self.post_body
         raise AssertionError("假 API 不认识这个端点：%s %s（实现跑偏了？）" % (method, path))
 
 
@@ -341,6 +367,20 @@ def self_test():
          dispatched=False)
     case("⑩ --input 写成没有 `=` 的样子 ⇒ 用法错误", EXIT_USAGE,
          _a(input=["nope"]), want_posts=0, exc="NAME=VALUE")
+
+    # ★ 422 那两条：**平台的原文必须原样出现在报错里**。
+    #   它们同码不同因，善后完全相反（改 inputs 名 vs 修 workflow 文件），
+    #   而 2026-09-27 做 issue #9 时这里原先只回一句「ref 或 inputs 不被接受」，
+    #   于是同一条 422 被归因了**两次**才对上。
+    case("⑪ 422 `Unexpected inputs provided` ⇒ 原文要打出来", EXIT_USAGE,
+         _a(), api_kw={"post_status": 422,
+                       "post_body": {"message": 'Unexpected inputs provided: ["local_sha"]'}},
+         exc="Unexpected inputs provided")
+    case("⑫ 422 `failed to parse workflow` ⇒ 原文要打出来", EXIT_USAGE,
+         _a(), api_kw={"post_status": 422,
+                       "post_body": {"message": "Invalid Argument - failed to parse workflow: "
+                                                "(Line: 748, Col: 14): Unexpected symbol: '..'"}},
+         exc="failed to parse workflow")
 
     total = n[0]
     print()
