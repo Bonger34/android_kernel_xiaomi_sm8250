@@ -14,13 +14,19 @@
 ## ⚠️ 判定为什么是 job 级，而不是 run 级
 
 规格那句「不记 `cancelled` / `timed_out` / `startup_failure`」说的是 **run 的结论**。
-但本工具**看不到自己这一轮的 run 结论**：它跑的这一刻那次 run 还没结束
-（构建器那条路里 `notify` 是它的一部分；检测器那条路里它就是一个 step）。
+但本工具**看不到自己这一轮的 run 结论**：它跑的这一刻那次 run 还没结束 ——
+它自己就是那次 run 的一部分（**两条路里 `notify` 都是一个独立 job**：构建器的
+`needs: [prepare, build, repro]`、检测器的 `needs: [detect]`）。
 ⇒ 判定改看 **`GET /actions/runs/<id>/jobs`** 的逐 job 结论 + 逐 step 结论，
 而 **`startup_failure`（run 根本没起来）在这一层是够不着的** —— 但那种情形下
 本工具**根本不会被调用**（没有 runner 去跑 `notify`）⇒ 「不写标记」是**结构性**的，
 不需要一条永远不会响的检查（同类批评见 `detect.py` 的 `run()` 里删掉的那条
 「新旧内容逐字相同 ⇒ 报错」）。
+
+🚨 **2026-09-27 订正（issue #17）**：上面这句原先写的是「检测器那条路里它就是一个 **step**」——
+**那个形状根本不会生效**：同一 job 内读 job 列表时，平台对**自己刚失败那一步**的回声
+还没出来 ⇒ 判 `V_NO_FAILURE`、静默什么都不做。现已改成**独立 job**，
+根因与两条同族教训见 `PROJECT.md` §7 坑表 **#61**。
 
 同理，**取消**也有一半是结构性的：一次被取消的 run 里 `notify` 通常根本不会开始。
 但只要它开始了，job 级判定就接管 —— 于是「取消」这一档**有**一条真的会响的检查。
@@ -91,7 +97,7 @@ EXIT_USAGE = 2
 V_REPORTED = "reported"          # 真失败：已开/追加 issue + 已写失败标记
 V_JITTER = "jitter"              # 基础设施抖动：不写标记、不开 issue，下一轮自己重试
 V_NO_FAILURE = "no-failure"      # 这一轮没有红（本工具不该被调用，但不是错误）
-V_NO_UPSTREAM = "no-upstream"    # 没有上游提交可记（手动触发的运行就是这样）
+V_NO_UPSTREAM = "no-upstream"    # 没有上游提交可记（手动触发，或检测器在判定前就失败）
 
 # job 级结论里「抖动」的那几档（规格实现决定 7 点名前三个，后两个同族：
 # `stale` = 排队太久被丢弃、`action_required` = 卡在人工批准上，都不是「构建失败」）
@@ -206,10 +212,14 @@ def classify(jobs, self_job=None):
     ⇒ **正确的用法：把上报放进一个独立的 job**（`needs: <会失败的那个>` + `if: failure()`）——
     那样它天然在对方结束之后才启动，API 早已回声完毕。`build.yml` 的 `notify` 一直如此，
     所以它没这个毛病；`detect.yml` 的 `notify` 自 #17 起也改成了同样的形状。
+    ⇒ 根因、量出来的余量（6 ms → 57 s）与两条同族教训见 `PROJECT.md` §7 坑表 **#61**。
 
-    ⚠️ 万一 `self_job` 没传对（或 CI 那边改了 job 名），后果同样是**静默**的：
-    本 job 会被当成「还没结束」、失败步骤被丢掉 ⇒ 判 `V_NO_FAILURE`。
-    所以下面那句「还有 N 个 job 没结束」的 ⚠️ **不是装饰** —— 它是这种漂移唯一看得见的痕迹。
+    ⚠️ **这一档只对「上报与失败在同一个 job」的旧形状成立** —— 本仓库**两条路都已不是**
+    那个形状（见上面 🚨）。新形状下失败在**另一个已经结束的** job 里，`self_job` 就算
+    写歪也只是把 `notify` 自己记进 `pending`，结论仍是 `V_REPORTED`；而且 `GITHUB_JOB`
+    是自动跟的，CI 上不存在「改 job 名导致漂移」这回事。
+    ⇒ `--self-job` 现在是**兼容参数**（给「同 job 上报」的形状留的），
+    下面那句「还有 N 个 job 没结束」的 ⚠️ 仍然有用 —— 它报的是**真正还没结束**的 job。
     """
     failures, jitter, pending = [], [], []
     for j in jobs or []:
@@ -468,9 +478,12 @@ def render_summary(r):
               "下一轮检测器会**自己重试**同一个提交。", ""]
     elif r["verdict"] == V_NO_UPSTREAM:
         L += ["### 没有上游提交可记", "",
-              "手动触发的运行就是这样（`inputs.upstream_sha` 为空）：",
-              "没有「哪个上游提交已试过」可记，也没有对应的 issue 标题可去重 ⇒ 什么都不做。",
-              "⚠️ 人工触发的失败是**人的事**：人就在旁边，链路不该替他决定拉黑谁。", ""]
+              "这次运行**没有可拉黑的对象**：`--upstream-sha` 为空。",
+              "⇒ 没有「哪个上游提交已试过」可记，也没有对应的 issue 标题可去重 ⇒ 什么都不做。",
+              "⚠️ **两种成因都会走到这里**（措辞不假定是哪一种）：① **人手动触发** —— "
+              "构建器那条路本来就没有上游提交；② **检测器在判定之前就失败了**"
+              "（checkout 挂 / API 抖动 ⇒ 它没写出 `upstream_sha`）。",
+              "两种都**不该**开 issue、也**不该**拉黑谁：前者的失败是人的事，后者是基础设施抖动。", ""]
     return "\n".join(L) + "\n"
 
 
@@ -481,8 +494,8 @@ def fetch_jobs(api, repo, run_id):
     """读这次 run 的 job 列表。
 
     ⚠️ 满一页**拒绝给结论**：只看见 100 个 job 就宣布「哪些红了」是典型的「不完整的绿」
-    （坑表 #32）—— 我们的 run 是 5 个 job（`prepare` + `build ×2` + `repro` + `notify`），
-    真要撞上这条线，说明**别的**东西也不对了。
+    （坑表 #32）—— 构建器那条路的 run 是 5 个 job（`prepare` + `build ×2` + `repro` + `notify`），
+    检测器那条路是 2 个（`detect` + `notify`）；真要撞上这条线，说明**别的**东西也不对了。
     """
     jobs = api.call("GET", "repos/%s/actions/runs/%s/jobs?per_page=%d" % (repo, run_id, JOBS_PAGE))
     items = (jobs or {}).get("jobs") or []
@@ -648,14 +661,18 @@ def run(a, api, log=print, dm=None, today=None):
         log("结论: %s —— %s" % (V_NO_FAILURE, v.reason))
         return r
 
-    # ── ② 没有上游提交 ⇒ 什么都不做（手动触发的运行就是这样）───────────────────────
+    # ── ② 没有上游提交 ⇒ 什么都不做 ──────────────────────────────────────────────
     # ⚠️ 这一档**不是**错误：没有「哪个上游提交已试过」可记，也没有稳定的 issue 标题可去重。
+    # ⚠️ 两种成因（见 `render_summary()` 里同一条）：**人手动触发**（构建器那条路根本没有
+    #    上游提交）；**检测器在判定之前就失败**（checkout 挂 / API 抖动 ⇒ `upstream_sha`
+    #    没写出来）。⚠️ 后者靠的是 `detect.py` 把 `--github-output` 写在**最后** ——
+    #    谁把它挪早，「一次抖动」就会变成「reported ⇒ 拉黑 7 天」。
     if not r["upstream_sha"]:
         r.update(verdict=V_NO_UPSTREAM,
                  reason="这次运行没有记录上游提交（`--upstream-sha` 为空）："
                         "没有可拉黑的对象、也没有可去重的 issue 标题 ⇒ 不写、不开")
         r["marker_line"] = "**没写**（没有上游提交可记）"
-        r["issue_line"] = "**没开**（手动触发的运行：那是人的事）"
+        r["issue_line"] = "**没开**（没有可拉黑的对象 —— 手动触发、或检测器判定前就失败）"
         log("")
         log("结论: %s —— %s" % (V_NO_UPSTREAM, r["reason"]))
         return r
@@ -945,7 +962,10 @@ def self_test():
         else:
             ok(what, "-> %s" % v.kind)
 
-    # ── 本 job 还在跑时，**它的失败步骤不能被漏掉**（检测器那条路只有这一个 job）──
+    # ── 本 job 还在跑时，**它的失败步骤不能被漏掉** ──
+    # ⚠️ 这一档**只对「上报与失败在同一个 job」的旧形状成立**。本仓库两条路都已改成
+    #    **独立 job**（检测器那条路自 issue #17 起）⇒ **生产上走不到这里**。
+    #    用例留着，是为了 `--self-job` 这个兼容参数还有回归网（详见 `classify()` 的 docstring）。
     n += 1
     v = classify([_job("detect", None, [(3, "检测", "success"), (5, "试合并", "failure")],
                        status="in_progress")], "detect")
@@ -1094,7 +1114,7 @@ def self_test():
     case("㉑ 抖动（超时）⇒ 同上，即使另有一个 job 报 failure", 
          [_job("build", "timed_out"), _job("repro", "failure", [(2, "Download", "failure")])],
          (V_JITTER, None, False), branch_sha="c0mmit", state=HB)
-    case("㉒ 没有上游提交（手动触发）⇒ 不写、不开", FAIL,
+    case("㉒ 没有上游提交（手动触发 / 检测器判定前就失败）⇒ 不写、不开", FAIL,
          (V_NO_UPSTREAM, None, False), upstream_sha="", branch_sha="c0mmit", state=HB)
 
     # ── dry-run：判据全跑，**一条写请求都不发** ────────────────────────────────
