@@ -27,6 +27,10 @@
 #
 #  ⚠️ #8 起本文件**会构建**（间接：派发构建器）。但那四步是**有条件**的：
 #     只有 `detect.py` 判出 `drifted` 才走；无漂移时一次运行仍是 50 秒左右就结束。
+#
+#  ⚠️ **本文件永远不推工作分支**（#9 起这条更明确）：它只读它、试合并、派发。
+#     推分支只发生在构建器那边的最后一步，且必须在整条链全绿之后。
+#     本文件的「收尾复核」正是这条不变量的反向守卫 —— 分支在本次运行里动过就**响亮地红**。
 # ══════════════════════════════════════════════════════════════════════════════
 name: Detect upstream drift (heartbeat + drift)
 
@@ -298,22 +302,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # ★ 七个入参**一个都不能空**：空的 `merge_sha` 会让构建器按「不合并」跑，
+          # ★ 八个入参**一个都不能空**：空的 `merge_sha` 会让构建器按「不合并」跑，
           #   产出一批**没有上游改动**的东西，而那次运行是**绿的** —— 最坏的一种失败；
           #   空的 `upstream_url` 会让构建侧重放合并时去默认的 LineageOS 仓库取那个 sha，
           #   而上游换成别的仓库（本文件的测试钩子）时**那就取不到**。
+          #   ⚠️ #9 起多一个 `local_sha`：**推分支前要核它等于合并提交的父[0]** ——
+          #   空值会让那一步直接跳过（构建器的 if 就挂在 merge_sha 上），
+          #   于是「全绿才推分支」悄悄不生效，而整次运行照样是绿的。
           #   `--require` 就是为这些设的：缺一个就**一个请求都不发**（退出码 2）。
           python3 .github/scripts/trigger-build.py \
             --repo "$GITHUB_REPOSITORY" --workflow "$BUILD_WORKFLOW" --ref "$WORK_BRANCH" \
             --input upstream_sha="${{ steps.detect.outputs.upstream_sha }}" \
             --input merge_base="${{ steps.detect.outputs.merge_base }}" \
             --input merge_sha="${{ steps.merge.outputs.merge_sha }}" \
+            --input local_sha="${{ steps.detect.outputs.local_sha }}" \
             --input base_run_id="${{ github.run_id }}" \
             --input base_artifact="base-img-${{ steps.merge.outputs.merge_sha }}" \
             --input base_sha256="$(cat base.sha256)" \
             --input base_date="$(cat base.date)" \
             --input upstream_url="https://github.com/${UPSTREAM_REPO}.git" \
             --require upstream_sha --require merge_sha --require merge_base \
+            --require local_sha \
             --require base_run_id --require base_artifact --require base_sha256 \
             --require upstream_url
           { echo ""; echo "### 触发构建"; echo ""
@@ -321,12 +330,14 @@ jobs:
             echo ""
             echo "⚠️ 派发接口**不返回 run id** —— 「哪一次」按时间 + 输入里的 \`merge_sha\` 对。"
             echo "⚠️ 本通道**只出 CI artifact，不碰 release**（发布仍由人手动做）。"
+            echo "⚠️ 「工作分支全绿才前进」是**构建器那一步**的活（#9）：本次运行**不推分支**。"
             echo ""; echo "👉 https://github.com/$GITHUB_REPOSITORY/actions/workflows/$BUILD_WORKFLOW"; } \
             >> "$GITHUB_STEP_SUMMARY"
 
-      # ⚠️ 这一条是给 #9 的地基：**全绿才推分支**。本次运行**没有**任何 push ——
-      #    试合并的结果只活在这个工作区与那个 artifact 里，工作分支仍是检测器开头读到的那个提交。
-      - name: "收尾复核：本次运行没有推进工作分支（#9 才做那件事）"
+      # ⚠️ 这一条是 #9 的**反向守卫**：本 workflow **任何情况下都不推工作分支**。
+      #    推分支只发生在构建器那边，且必须在整条链全绿之后（issue #9）。
+      #    这里是它成立的前提 —— 检测器跑完之后，分支仍是它开头读到的那个提交。
+      - name: "收尾复核：本次运行没有推进工作分支（推分支是构建器的活，#9）"
         if: steps.detect.outputs.state == 'drifted' && github.event.inputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -334,12 +345,20 @@ jobs:
           set -euo pipefail
           NOW="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$WORK_BRANCH" --jq .object.sha)"
           BEFORE="${{ steps.detect.outputs.local_sha }}"
-          [ "$NOW" = "$BEFORE" ] || {
+          if [ "$NOW" != "$BEFORE" ]; then
+            # ⚠️ 这里**不能**放宽成「只要 NOW 是 BEFORE 的后代就算过」。两条理由：
+            #   ① 本 workflow 里没有任何推分支的代码 ⇒ 唯一变动的可能是**别人**在动它，
+            #      而那正是该被人看见的事（同一条分支上两个 writer）；
+            #   ② 真出现那种情况时，本轮试合并算出来的 merge_sha 已经**不是**分支 HEAD 的
+            #      快速前进目标了 —— 构建器那边的 promote.py 会判「分支已前进」（退出码 3）
+            #      并**让路**，两个 writer **不会互相覆盖**（`force: false` 再加一道）。
             echo "❌ 工作分支 $WORK_BRANCH 从 $BEFORE 变成了 $NOW"
-            echo "   本工单（#8）**只试合并不推分支**；推分支是 #9，且必须是构建全绿之后。"
+            echo "   本 workflow **只试合并不推分支**；推分支是构建器在全绿之后做的（#9）。"
+            echo "   ⇒ 说明有**别的东西**写了这条分支（并发的构建器？有人手推？）。"
+            echo "      本轮算出的 merge_sha 已经不是它的快速前进目标了，构建器那边会让路。"
             exit 1
-          }
-          echo "✅ 工作分支仍是 $NOW —— 「分支 = 可发布状态」这个不变量今天没有被破"
+          fi
+          echo "✅ 工作分支仍是 $NOW —— 检测器一个字节都没动它"
           { echo ""; echo "### 收尾"; echo ""
-            echo "✅ \`$WORK_BRANCH\` 从头到尾是 \`$NOW\` —— 本次运行**一个字节都没推**。"
-            echo "（推分支是 #9：构建全绿之后才推。）"; } >> "$GITHUB_STEP_SUMMARY"
+            echo "✅ \`$WORK_BRANCH\` 从头到尾是 \`$NOW\` —— 检测器**一个字节都没推**。"
+            echo "（推分支是构建器在全绿之后做的：issue #9。）"; } >> "$GITHUB_STEP_SUMMARY"
