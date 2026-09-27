@@ -470,13 +470,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # ⚠️ **不传 `--self-job`**：它的默认值就是 `GITHUB_JOB`（= 本 job 的 id），
+          #    在这里再写一遍就是同一个事实两处各记一份（漂移后果是静默的，见 build.yml 的同款注释）。
+          # `--base-sha256` 用 `|| true` 兜底：底包是**后面**那一步才取的，
+          # 试合并冲突时这份文件根本不存在 —— 那种情形下这一栏如实留空。
           python3 .github/scripts/report-failure.py \
             --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
             --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --self-job detect \
             --upstream-sha "${{ steps.detect.outputs.upstream_sha }}" \
             --merge-sha "${{ steps.merge.outputs.merge_sha }}" \
             --merge-base "${{ steps.detect.outputs.merge_base }}" \
+            --base-sha256 "$(cat base.sha256 2>/dev/null || true)" \
             --work-branch "$WORK_BRANCH" \
             --heartbeat-branch "$HEARTBEAT_BRANCH" \
             --json-out report-failure.json \
