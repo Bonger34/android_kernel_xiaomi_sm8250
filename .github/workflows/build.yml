@@ -909,6 +909,12 @@ jobs:
   # ⚠️ **判定一行都不在 YAML 里**：`report-failure.py` 自己读这次 run 的 job 列表
   #    （谁红了、红在第几步）与产物清单，再决定写什么。同 `detect.py` / `package.py`
   #    的理由：本机没有可用的 bash，写在 YAML 里的逻辑只能上 CI 试，一轮十几分钟。
+  #
+  # ⚠️ **加新 job 时记得加进下面的 `needs:`** —— 工具读的是 API 给的**全量** job 列表，
+  #    而这里列的是「它要等谁跑完」。漏加一个（例如将来再加一个后处理 job）的后果是：
+  #    那个 job 红时 `failure()` 仍为真（它等着的那几个里有人红过），但**工具读不到它的结论**
+  #    （那一刻它还没结束 ⇒ 进 `pending`）⇒ 报出来的失败环节**不是**真正的那一个。
+  #    （`--self-job` 那处**不需要**约定：默认值就是 `GITHUB_JOB`，job 改名会自动跟上。）
   notify:
     needs: [prepare, build, repro]
     if: failure() && inputs.upstream_sha != ''
@@ -936,12 +942,12 @@ jobs:
           # ⚠️ 退出码**有语义**：0 = 处置完成（**含「抖动 ⇒ 不写标记、不开 issue」这一档**），
           #    1 = 运行错误，2 = 用法错误。工具不会因为它自己判出「抖动」而返非零 ——
           #    把四种结论压成「非零即错」会让一次正常的抖动看起来像故障。
-          # ⚠️ `--self-job notify`：本工具就活在这个 job 里，而它此刻的结论还是 `null`
-          #    ⇒ 判定必须知道「哪个 job 是自己」，否则**自己那一步的失败会被漏掉**。
+          # ⚠️ **不传 `--self-job`**：它的默认值就是 `GITHUB_JOB`（= 本 job 的 id），
+          #    在这里再写一遍就是同一个事实两处各记一份 —— 而这一处漂移起来是**静默**的
+          #    （job 改名后本 job 会被当成「还没结束」⇒ 判 no-failure ⇒ 不开 issue、不写标记）。
           python3 .github/scripts/report-failure.py \
             --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
             --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --self-job notify \
             --upstream-sha "${{ inputs.upstream_sha }}" \
             --merge-sha "${{ inputs.merge_sha }}" \
             --merge-base "${{ inputs.merge_base }}" \
